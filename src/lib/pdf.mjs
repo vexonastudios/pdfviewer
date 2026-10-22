@@ -61,30 +61,6 @@ export async function writePdf(original, fields, values, additions = [], { flatt
     if (field instanceof PDFTextField) field.updateAppearances(font, fittingTextFieldAppearance);
     expected.push([descriptor.name, value]);
   }
-  for (const addition of additions) {
-    const page = doc.getPage(addition.page - 1);
-    const color = rgb(0.10, 0.16, 0.22);
-    if (addition.kind === 'text') {
-      ensureText(addition.text);
-      const angle = addition.rotation || 0;
-      const radians = angle * Math.PI / 180;
-      const down = addition.size * 0.86;
-      page.drawText(addition.text.replace(/\t/g, '    '), {
-        x: addition.x + Math.sin(radians) * down, y: addition.y - Math.cos(radians) * down,
-        size: addition.size, font, color, rotate: degrees(angle), lineHeight: addition.size * 1.25,
-      });
-    } else if (addition.kind === 'signature') {
-      if (!/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(addition.dataUrl || '') || addition.dataUrl.length > 2_000_000 || !(addition.width > 0 && addition.width <= 500) || !(addition.height > 0 && addition.height <= 500)) throw new Error('A placed signature is invalid.');
-      const image = await doc.embedPng(addition.dataUrl);
-      const angle = (addition.rotation || 0) * Math.PI / 180;
-      page.drawImage(image, { x: addition.x + Math.sin(angle) * addition.height, y: addition.y - Math.cos(angle) * addition.height, width: addition.width, height: addition.height, rotate: degrees(addition.rotation || 0) });
-    } else if (addition.kind === 'check') {
-      const angle = (addition.rotation || 0) * Math.PI / 180;
-      const point = (x, y) => ({ x: addition.x + x * Math.cos(angle) + y * Math.sin(angle), y: addition.y + x * Math.sin(angle) - y * Math.cos(angle) });
-      page.drawLine({ start: point(0, 0.45 * addition.size), end: point(0.32 * addition.size, 0.8 * addition.size), thickness: addition.size * 0.12, color });
-      page.drawLine({ start: point(0.32 * addition.size, 0.8 * addition.size), end: point(addition.size, 0), thickness: addition.size * 0.12, color });
-    }
-  }
   form.updateFieldAppearances(font);
   // Some forms use ZapfDingbats character "4" for square choices. Its tiny
   // font-based check can disappear in rendered and printed PDFs. Replace it
@@ -111,6 +87,32 @@ export async function writePdf(original, fields, values, additions = [], { flatt
       }
     }
     doc.catalog.delete(PDFName.of('AcroForm'));
+  }
+  // Draw movable additions after flattening so a form widget cannot paint over
+  // a signature or text placed within its rectangle.
+  for (const addition of additions) {
+    const page = doc.getPage(addition.page - 1);
+    const color = rgb(0.10, 0.16, 0.22);
+    if (addition.kind === 'text') {
+      ensureText(addition.text);
+      const angle = addition.rotation || 0;
+      const radians = angle * Math.PI / 180;
+      const down = addition.size * 0.86;
+      page.drawText(addition.text.replace(/\t/g, '    '), {
+        x: addition.x + Math.sin(radians) * down, y: addition.y - Math.cos(radians) * down,
+        size: addition.size, font, color, rotate: degrees(angle), lineHeight: addition.size * 1.25,
+      });
+    } else if (addition.kind === 'signature') {
+      if (!/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(addition.dataUrl || '') || addition.dataUrl.length > 2_000_000 || !(addition.width > 0 && addition.width <= 500) || !(addition.height > 0 && addition.height <= 500)) throw new Error('A placed signature is invalid.');
+      const image = await doc.embedPng(addition.dataUrl);
+      const angle = (addition.rotation || 0) * Math.PI / 180;
+      page.drawImage(image, { x: addition.x + Math.sin(angle) * addition.height, y: addition.y - Math.cos(angle) * addition.height, width: addition.width, height: addition.height, rotate: degrees(addition.rotation || 0) });
+    } else if (addition.kind === 'check') {
+      const angle = (addition.rotation || 0) * Math.PI / 180;
+      const point = (x, y) => ({ x: addition.x + x * Math.cos(angle) + y * Math.sin(angle), y: addition.y + x * Math.sin(angle) - y * Math.cos(angle) });
+      page.drawLine({ start: point(0, 0.45 * addition.size), end: point(0.32 * addition.size, 0.8 * addition.size), thickness: addition.size * 0.12, color });
+      page.drawLine({ start: point(0.32 * addition.size, 0.8 * addition.size), end: point(addition.size, 0), thickness: addition.size * 0.12, color });
+    }
   }
   const output = await doc.save();
   const reopened = await PDFDocument.load(output);
