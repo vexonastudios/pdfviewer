@@ -1,0 +1,99 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { PDFDocument, PDFName, PDFDict, degrees } from 'pdf-lib';
+import { createSample } from '../src/lib/sample.mjs';
+import { inspectPdf, writePdf } from '../src/lib/pdf.mjs';
+
+const fontBytes = new Uint8Array(await readFile(new URL('../public/fonts/NotoSans-Regular.ttf', import.meta.url)));
+const original = await createSample();
+const { fields } = await inspectPdf(original);
+const values = Object.fromEntries(fields.map(field => [field.name, field.value]));
+await mkdir(new URL('../tmp/qa/', import.meta.url), { recursive: true });
+await writeFile(new URL('../tmp/qa/sample.pdf', import.meta.url), original);
+test('saves Unicode, checkbox and dropdown values in the form tree, with appearances', async () => {
+  const expected = { ...values, 'Full name': 'José García', 'Email address': 'jose@example.com', 'Phone number': '(555) 010-0248', 'Company': 'Northwind Studio', 'Street address': '15 Oak Avenue', 'City': 'Madison', 'Postal code': '00123', 'Notes': 'Please call after 3 pm.', 'Send updates': true, 'Contact method': 'Phone' };
+  const output = await writePdf(original, fields, expected, [], { fontBytes });
+  const reopened = await PDFDocument.load(output);
+  assert.equal(reopened.getForm().getTextField('Full name').getText(), 'José García');
+  assert.equal(reopened.getForm().getTextField('Postal code').getText(), '00123');
+  assert.equal(reopened.getForm().getCheckBox('Send updates').isChecked(), true);
+  assert.deepEqual(reopened.getForm().getDropdown('Contact method').getSelected(), ['Phone']);
+  for (const field of reopened.getForm().getFields()) for (const widget of field.acroField.getWidgets()) assert.ok(widget.dict.lookup(PDFName.of('AP'), PDFDict).get(PDFName.of('N')));
+  const originalAgain = await PDFDocument.load(original);
+  assert.equal(originalAgain.getForm().getTextField('Full name').getText(), undefined);
+  await writeFile(new URL('../tmp/qa/filled.pdf', import.meta.url), output);
+});
+test('flattening removes form widgets, and placed text is exported', async () => {
+  const additions = [{ kind: 'text', text: 'Reviewed by Jamie', x: 48, y: 115, size: 11, page: 1, rotation: 0 }, { kind: 'check', x: 400, y: 115, size: 14, page: 1, rotation: 0 }];
+  const output = await writePdf(original, fields, { ...values, 'Full name': 'Jamie Parker' }, additions, { flatten: true, fontBytes });
+  const reopened = await PDFDocument.load(output);
+  assert.equal(reopened.getForm().getFields().length, 0);
+  for (const page of reopened.getPages()) {
+    const annotations = page.node.Annots();
+    for (let i = 0; i < (annotations?.size() ?? 0); i++) assert.notEqual(annotations.lookup(i, PDFDict).get(PDFName.of('Subtype'))?.toString(), '/Widget');
+  }
+  await writeFile(new URL('../tmp/qa/flattened.pdf', import.meta.url), output);
+});
+test('different records are independent, and clearing fields survives reopening', async () => {
+  const a = await writePdf(original, fields, { ...values, 'Full name': 'Record A', 'Contact method': '' }, [], { fontBytes });
+  const b = await writePdf(original, fields, { ...values, 'Full name': 'Record B' }, [], { fontBytes });
+  assert.equal((await PDFDocument.load(a)).getForm().getTextField('Full name').getText(), 'Record A');
+  assert.deepEqual((await PDFDocument.load(a)).getForm().getDropdown('Contact method').getSelected(), []);
+  assert.equal((await PDFDocument.load(b)).getForm().getTextField('Full name').getText(), 'Record B');
+});
+test('radio and multi-select fields preserve their typed values', async () => {
+  const doc = await PDFDocument.create(); const page = doc.addPage();
+  const radio = doc.getForm().createRadioGroup('Priority'); radio.addOptionToPage('Normal', page, { x: 50, y: 650 }); radio.addOptionToPage('Urgent', page, { x: 50, y: 600 });
+  const list = doc.getForm().createOptionList('Interests'); list.addOptions(['One', 'Two', 'Three']); list.enableMultiselect(); list.addToPage(page, { x: 100, y: 600, width: 100, height: 100 });
+  const bytes = await doc.save(); const { fields } = await inspectPdf(bytes);
+  const output = await writePdf(bytes, fields, { Priority: 'Urgent', Interests: ['One', 'Three'] }, [], { fontBytes });
+  const reopened = await PDFDocument.load(output);
+  assert.equal(reopened.getForm().getRadioGroup('Priority').getSelected(), 'Urgent');
+  assert.deepEqual(reopened.getForm().getOptionList('Interests').getSelected(), ['One', 'Three']);
+});
+
+test('square radio choices render a font-independent check mark', async () => {
+  const doc = await PDFDocument.create(); const page = doc.addPage();
+  const radio = doc.getForm().createRadioGroup('Coverage');
+  radio.addOptionToPage('Yes', page, { x: 50, y: 650, width: 12, height: 12 });
+  radio.addOptionToPage('No', page, { x: 90, y: 650, width: 12, height: 12 });
+  for (const widget of radio.acroField.getWidgets()) widget.getAppearanceCharacteristics().setCaptions({ normal: '4' });
+  const bytes = await doc.save(); const { fields } = await inspectPdf(bytes);
+  const reopened = await PDFDocument.load(await writePdf(bytes, fields, { Coverage: 'No' }, [], { fontBytes }));
+  const filled = reopened.getForm().getRadioGroup('Coverage');
+  assert.equal(filled.getSelected(), 'No');
+  const widgets = filled.acroField.getWidgets();
+  assert.equal(widgets[1].getAppearanceState().toString(), widgets[1].getOnValue().toString());
+  for (const widget of widgets) {
+    const normal = widget.dict.lookup(PDFName.of('AP'), PDFDict).lookup(PDFName.of('N'), PDFDict);
+    const on = normal.lookup(widget.getOnValue());
+    assert.equal(on.dict.get(PDFName.of('Resources')), undefined);
+  }
+});
+test('square checkboxes render a font-independent check mark', async () => {
+  const doc = await PDFDocument.create(); const page = doc.addPage();
+  const box = doc.getForm().createCheckBox('Monthly assistance');
+  box.addToPage(page, { x: 50, y: 650, width: 12, height: 12 });
+  box.acroField.getWidgets()[0].getAppearanceCharacteristics().setCaptions({ normal: '4' });
+  const bytes = await doc.save(); const { fields } = await inspectPdf(bytes);
+  const reopened = await PDFDocument.load(await writePdf(bytes, fields, { 'Monthly assistance': true }, [], { fontBytes }));
+  const filled = reopened.getForm().getCheckBox('Monthly assistance');
+  assert.equal(filled.isChecked(), true);
+  const widget = filled.acroField.getWidgets()[0];
+  assert.equal(widget.getAppearanceState().toString(), widget.getOnValue().toString());
+  const normal = widget.dict.lookup(PDFName.of('AP'), PDFDict).lookup(PDFName.of('N'), PDFDict);
+  const on = normal.lookup(widget.getOnValue());
+  assert.equal(on.dict.get(PDFName.of('Resources')), undefined);
+});
+test('rejects unsupported glyphs instead of silently corrupting saved text', async () => {
+  await assert.rejects(() => writePdf(original, fields, { ...values, 'Full name': '😀' }, [], { fontBytes }), /cannot display/);
+});
+test('creates rotation and crop box fixtures for viewer placement checks', async () => {
+  const doc = await PDFDocument.create();
+  for (const rotation of [0, 90, 180, 270]) {
+    const page = doc.addPage([612, 792]); page.setRotation(degrees(rotation)); page.setCropBox(25, 35, 560, 700);
+    page.drawText(`Page rotated ${rotation} degrees`, { x: 50, y: 700, size: 18 });
+  }
+  await writeFile(new URL('../tmp/qa/rotated.pdf', import.meta.url), await doc.save());
+});
