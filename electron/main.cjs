@@ -14,9 +14,10 @@ function validSignature(record) {
       !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(record.dataUrl) || record.dataUrl.length > 2_000_000 ||
       !Number.isInteger(record.width) || !Number.isInteger(record.height) ||
       record.width < 1 || record.height < 1 || record.width > 3000 || record.height > 3000) throw new Error('Invalid signature image.');
+  if (record.placementWidth !== undefined && (!Number.isFinite(record.placementWidth) || record.placementWidth < 20 || record.placementWidth > 350)) throw new Error('Invalid saved signature width.');
   const png = Buffer.from(record.dataUrl.slice('data:image/png;base64,'.length), 'base64');
   if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('A PNG signature image is required.');
-  return { signer: record.signer, dataUrl: record.dataUrl, width: record.width, height: record.height };
+  return { signer: record.signer, dataUrl: record.dataUrl, width: record.width, height: record.height, ...(record.placementWidth === undefined ? {} : { placementWidth: record.placementWidth }) };
 }
 async function readSignatures() {
   try {
@@ -138,12 +139,24 @@ ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sou
 ipcMain.handle('pdf:signatures-list', async event => { validSender(event); return readSignatures(); });
 ipcMain.handle('pdf:signatures-save', async (event, record) => {
   validSender(event);
-  const safe = validSignature(record);
-  const records = (await readSignatures()).filter(item => item.signer !== safe.signer);
+  const existing = await readSignatures();
+  const previous = existing.find(item => item.signer === record?.signer);
+  const safe = validSignature({ ...record, placementWidth: previous?.placementWidth ?? record?.placementWidth });
+  const records = existing.filter(item => item.signer !== safe.signer);
   if (records.length >= 20) throw new Error('Remove a saved signature before adding another.');
   records.push(safe);
   await writeSignatures(records);
   return records;
+});
+ipcMain.handle('pdf:signatures-size', async (event, signer, placementWidth) => {
+  validSender(event);
+  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80 || !Number.isFinite(placementWidth) || placementWidth < 20 || placementWidth > 350) throw new Error('Invalid saved signature width.');
+  const records = await readSignatures();
+  const record = records.find(item => item.signer === signer);
+  if (!record) throw new Error('This signature is no longer saved on this computer.');
+  record.placementWidth = placementWidth;
+  await writeSignatures(records);
+  return placementWidth;
 });
 ipcMain.handle('pdf:signatures-remove', async (event, signer) => {
   validSender(event);

@@ -23,14 +23,14 @@ async function desktopHarness(argv = ['electron', root]) {
     loadURL(url) { this.loadedURL = url; }
   }
   const electron = {
-    app: { requestSingleInstanceLock: () => true, quit() {}, on() {}, whenReady: () => Promise.resolve(), isPackaged: true },
+    app: { requestSingleInstanceLock: () => true, quit() {}, on() {}, whenReady: () => Promise.resolve(), isPackaged: true, getPath: () => path.join(root, 'tmp/qa/signature-size-app') },
     BrowserWindow: WindowMock, dialog,
     ipcMain: { handle: (name, handler) => handlers.set(name, handler), on: (name, handler) => listeners.set(name, handler) },
     Menu: { setApplicationMenu() {} }, shell: { showItemInFolder() {} },
     protocol: { registerSchemesAsPrivileged() {}, handle: (name, handler) => protocols.set(name, handler) },
     net: { fetch: async url => new Response(url) },
   };
-  const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Uint8Array, Response, URL });
+  const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Buffer, Uint8Array, Response, URL });
   vm.runInContext(await readFile(path.join(root, 'electron/main.cjs'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
   return { handlers, listeners, protocols, dialog, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
@@ -115,4 +115,23 @@ test('closing with unsaved edits can be cancelled', async () => {
   h.dialog.showMessageBoxSync = () => 1; prevented = false;
   h.window.listeners.get('close')({ preventDefault: () => { prevented = true; } });
   assert.equal(prevented, false);
+});
+
+test('signature widths persist per signer without changing the ink image', async () => {
+  const signatureFile = path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF/signatures.json');
+  await mkdir(path.dirname(signatureFile), { recursive: true });
+  await writeFile(signatureFile, '[]');
+  const h = await desktopHarness();
+  const dataUrl = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64')}`;
+  const save = h.handlers.get('pdf:signatures-save');
+  await save(h.event, { signer: 'Signer One', dataUrl, width: 800, height: 200 });
+  await save(h.event, { signer: 'Signer Two', dataUrl, width: 800, height: 200 });
+  await h.handlers.get('pdf:signatures-size')(h.event, 'Signer One', 56);
+  const records = await h.handlers.get('pdf:signatures-list')(h.event);
+  assert.equal(records.find(item => item.signer === 'Signer One').placementWidth, 56);
+  assert.equal(records.find(item => item.signer === 'Signer Two').placementWidth, undefined);
+  assert.equal(records[0].dataUrl, dataUrl);
+  await save(h.event, { signer: 'Signer One', dataUrl, width: 800, height: 200, placementWidth: 100 });
+  assert.equal((await h.handlers.get('pdf:signatures-list')(h.event)).find(item => item.signer === 'Signer One').placementWidth, 56);
+  await assert.rejects(() => h.handlers.get('pdf:signatures-size')(h.event, 'Signer One', 500), /Invalid saved signature width/);
 });

@@ -9,11 +9,13 @@ import { inspectPdf, writePdf, fieldSchema } from './lib/pdf.mjs';
 import { parseBulk, suggestMapping, previewRecord } from './lib/bulk.mjs';
 import { createSample } from './lib/sample.mjs';
 import { formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
+import { preferredSignatureWidth, signatureSizeForField } from './lib/signature-size.mjs';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 const emptyState = { values: {}, additions: [] };
 const fingerprint = state => JSON.stringify(state);
 const fileStem = name => name.replace(/\.pdf$/i, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+const signatureSigner = item => item.signer || (item.label?.endsWith(' signature') ? item.label.slice(0, -' signature'.length) : null);
 function finalFolder(filePath) {
   if (!filePath) return null;
   const parent = filePath.replace(/[\\/][^\\/]+$/, '');
@@ -114,12 +116,15 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [signatures, setSignatures] = useState([]), [activeSignature, setActiveSignature] = useState(null), [signTarget, setSignTarget] = useState(null);
   const inputRef = useRef(null), loadTask = useRef(null), documentRef = useRef(null), searchRun = useRef(0), dragCount = useRef(0);
+  const signatureWidthTimers = useRef(new Map()), signatureWidthWrites = useRef(Promise.resolve());
   const state = history.present;
   const dirty = Boolean(documentState && fingerprint(state) !== saved);
   const readOnly = Boolean(documentState?.readOnlyReason);
   const fields = documentState?.fields ?? [];
   const additions = state.additions;
   const selectedItem = additions.find(item => item.id === selected);
+  const selectedSignatureSigner = selectedItem?.kind === 'signature' ? signatureSigner(selectedItem) : null;
+  const selectedSavedSignature = signatures.find(record => record.signer === selectedSignatureSigner && record.dataUrl === selectedItem?.dataUrl);
   const allFields = useMemo(() => [...fields.filter(field => !['signature', 'button', 'unsupported'].includes(field.type)), ...additions.filter(item => item.kind === 'text').map(item => ({ name: `Text: ${item.label}`, label: item.label, type: 'text', value: item.text, readOnly: false, options: [] }))], [fields, additions]);
   const labels = additions.filter(item => item.kind === 'text').map(item => item.label.trim().toLowerCase());
   const duplicateNames = labels.some(label => !label) || new Set(labels).size !== labels.length;
@@ -140,9 +145,35 @@ export default function App() {
       .then(setSignatures).catch(error => setError(`Saved signatures could not be loaded: ${error.message}`));
   }, []);
   async function saveSignature(record) {
-    const next = window.paperdesk ? await window.paperdesk.saveSignature(record) : [...signatures.filter(item => item.signer !== record.signer), record];
+    const previous = signatures.find(item => item.signer === record.signer);
+    const replacement = { ...record, ...(previous?.placementWidth === undefined ? {} : { placementWidth: previous.placementWidth }) };
+    const next = window.paperdesk ? await window.paperdesk.saveSignature(replacement) : [...signatures.filter(item => item.signer !== record.signer), replacement];
     if (!window.paperdesk) localStorage.setItem('paperdesk-signatures', JSON.stringify(next));
     setSignatures(next); notify(`${record.signer}’s signature is saved on this computer.`);
+  }
+  function flushSignatureWidth(signer) {
+    const pending = signatureWidthTimers.current.get(signer);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    signatureWidthTimers.current.delete(signer);
+    if (!window.paperdesk) return;
+    signatureWidthWrites.current = signatureWidthWrites.current.catch(() => {}).then(() => window.paperdesk.setSignatureWidth(signer, pending.width));
+    signatureWidthWrites.current.catch(error => setError(`Signature size could not be saved: ${error.message}`));
+  }
+  function resizeSignature(item, width) {
+    updateItem(item.id, { width, height: item.height * width / item.width });
+    const signer = signatureSigner(item);
+    const record = signatures.find(saved => saved.signer === signer && saved.dataUrl === item.dataUrl);
+    if (!record) return;
+    setSignatures(current => current.map(saved => saved.signer === signer ? { ...saved, placementWidth: width } : saved));
+    setActiveSignature(current => current?.signer === signer ? { ...current, placementWidth: width } : current);
+    if (!window.paperdesk) {
+      const stored = JSON.parse(localStorage.getItem('paperdesk-signatures') || '[]');
+      localStorage.setItem('paperdesk-signatures', JSON.stringify(stored.map(saved => saved.signer === signer ? { ...saved, placementWidth: width } : saved)));
+    } else {
+      clearTimeout(signatureWidthTimers.current.get(signer)?.timer);
+      signatureWidthTimers.current.set(signer, { width, timer: setTimeout(() => flushSignatureWidth(signer), 350) });
+    }
   }
   async function removeSignature(signer) {
     try {
@@ -328,8 +359,8 @@ export default function App() {
     const id = crypto.randomUUID();
     if (tool === 'signature') {
       if (!activeSignature) return;
-      const width = Math.min(160, 80 * activeSignature.width / activeSignature.height), height = width * activeSignature.height / activeSignature.width;
-      update(current => ({ ...current, additions: [...current.additions, { id, ...position, kind: 'signature', text: '', label: `${activeSignature.signer} signature`, dataUrl: activeSignature.dataUrl, width, height, size: 12 }] }));
+      const width = preferredSignatureWidth(activeSignature), height = width * activeSignature.height / activeSignature.width;
+      update(current => ({ ...current, additions: [...current.additions, { id, ...position, kind: 'signature', text: '', label: `${activeSignature.signer} signature`, signer: activeSignature.signer, dataUrl: activeSignature.dataUrl, width, height, size: 12 }] }));
       setSelected(id); setTool('select'); setTab('fields');
       return;
     }
@@ -349,11 +380,10 @@ export default function App() {
   function placeSignatureInField(record, target) {
     const [x1, y1, x2, y2] = target.rect;
     const left = Math.min(x1, x2), top = Math.max(y1, y2);
-    const boxWidth = Math.abs(x2 - x1), boxHeight = Math.abs(y2 - y1);
-    const scale = Math.min(Math.max(1, boxWidth - 22) / record.width, Math.max(1, boxHeight - 2) / record.height);
-    const width = record.width * scale, height = record.height * scale;
+    const boxHeight = Math.abs(y2 - y1);
+    const { width, height } = signatureSizeForField(record, target.rect);
     const id = crypto.randomUUID();
-    const item = { id, kind: 'signature', targetField: target.fieldName, page: target.page, x: left + 16, y: top - (boxHeight - height) / 2, text: '', label: `${record.signer} signature`, dataUrl: record.dataUrl, width, height, size: 12, rotation: 0 };
+    const item = { id, kind: 'signature', targetField: target.fieldName, page: target.page, x: left + 16, y: top - (boxHeight - height) / 2, text: '', label: `${record.signer} signature`, signer: record.signer, dataUrl: record.dataUrl, width, height, size: 12, rotation: 0 };
     const dateField = fields.find(field => field.name === target.dateFieldName);
     const flatDate = target.date && { id: crypto.randomUUID(), kind: 'text', targetField: `${target.fieldName}:date`, page: target.page, x: target.date.x, y: target.date.y, text: formatLocalDate(), label: target.date.label, size: 10, rotation: 0 };
     update(current => ({
@@ -391,7 +421,7 @@ export default function App() {
         <aside className="inspector"><div className="panel-tabs" role="tablist" aria-label="Document tools"><button role="tab" aria-selected={tab === 'fields'} className={tab === 'fields' ? 'active' : ''} onClick={() => setTab('fields')}><List size={16} /> Fields</button><button role="tab" aria-selected={tab === 'bulk'} className={tab === 'bulk' ? 'active' : ''} onClick={() => setTab('bulk')} disabled={readOnly}><Sparkles size={16} /> Bulk fill</button><button role="tab" aria-selected={tab === 'search'} className={tab === 'search' ? 'active search-tab' : 'search-tab'} onClick={() => setTab('search')} title="Find text (Ctrl+F)" aria-label="Find text"><Search size={17} /></button></div>
           <BulkPanel key={documentState.id} active={tab === 'bulk'} fields={allFields} busy={Boolean(busy)} duplicateNames={duplicateNames} onApply={values => { update(current => applyValues(values, current)); notify(`${Object.keys(values).length} field values applied. Review the page before saving.`); }} onBatch={batch} onCopy={copySchema} />
           {tab === 'search' ? <div className="panel-body"><div className="section-eyebrow">FIND YOUR PLACE</div><h2>Search this PDF</h2><form onSubmit={findText} className="search-form"><input id="document-search" aria-label="Search document text" placeholder="Find a word or phrase…" value={search} onChange={event => { setSearch(event.target.value); setSearchResults([]); searchRun.current++; setSearching(false); }} /><button className="primary" disabled={searching || !search.trim()} aria-label="Search"><Search size={16} /></button></form><p className="tiny muted">Searches existing document text. Scanned images need OCR, which this version does not include.</p>{searching ? <p className="muted">Searching pages…</p> : <><div className="section-heading"><h3>Matching pages</h3><span className="pill">{searchResults.length}</span></div>{searchResults.map(result => <button key={result.page} className="search-result" onClick={() => setPage(result.page)}><strong>Page {result.page}</strong><span>{result.snippet}</span></button>)}</>}</div> : tab === 'fields' ? <div className="panel-body fields-panel">
-            {selectedItem && <section className="added-editor"><div className="section-heading"><h3>{selectedItem.kind === 'text' ? 'Your text box' : selectedItem.kind === 'signature' ? selectedItem.label : 'Your checkmark'}</h3><button className="icon-button" aria-label="Delete selected item" onClick={() => { removeSelected(); }}><Trash2 size={16} /></button></div>{selectedItem.kind === 'text' && <><label className="input-label" htmlFor="added-text-value">Text</label><textarea id="added-text-value" rows={3} value={selectedItem.text} onChange={event => updateItem(selectedItem.id, { text: event.target.value })} /><label className="input-label" htmlFor="added-text-label">Field name <span>for bulk filling</span></label><input id="added-text-label" value={selectedItem.label} onChange={event => updateItem(selectedItem.id, { label: event.target.value })} /></>}{selectedItem.kind === 'signature' ? <><label className="input-label" htmlFor="signature-width">Signature width</label><input id="signature-width" type="range" min="60" max="350" value={selectedItem.width} onChange={event => { const width = Number(event.target.value); updateItem(selectedItem.id, { width, height: selectedItem.height * width / selectedItem.width }); }} /><span className="tiny muted">{Math.round(selectedItem.width)} pt wide</span></> : <><label className="input-label" htmlFor="text-size">{selectedItem.kind === 'text' ? 'Font size' : 'Size'}</label><select id="text-size" value={selectedItem.size} onChange={event => updateItem(selectedItem.id, { size: Number(event.target.value) })}>{[6, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96].map(size => <option key={size} value={size}>{size} pt</option>)}</select></>}<p className="tiny muted">Drag on the page to reposition. Save a workspace to keep placements editable.</p></section>}
+            {selectedItem && <section className="added-editor"><div className="section-heading"><h3>{selectedItem.kind === 'text' ? 'Your text box' : selectedItem.kind === 'signature' ? selectedItem.label : 'Your checkmark'}</h3><button className="icon-button" aria-label="Delete selected item" onClick={() => { removeSelected(); }}><Trash2 size={16} /></button></div>{selectedItem.kind === 'text' && <><label className="input-label" htmlFor="added-text-value">Text</label><textarea id="added-text-value" rows={3} value={selectedItem.text} onChange={event => updateItem(selectedItem.id, { text: event.target.value })} /><label className="input-label" htmlFor="added-text-label">Field name <span>for bulk filling</span></label><input id="added-text-label" value={selectedItem.label} onChange={event => updateItem(selectedItem.id, { label: event.target.value })} /></>}{selectedItem.kind === 'signature' ? <><label className="input-label" htmlFor="signature-width">Signature width</label><input id="signature-width" type="range" min="20" max="350" value={selectedItem.width} onChange={event => resizeSignature(selectedItem, Number(event.target.value))} onPointerUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} onKeyUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} onBlur={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} /><span className="tiny muted">{Math.round(selectedItem.width)} pt wide</span>{selectedSavedSignature && <p className="tiny muted">This size is saved for {selectedSignatureSigner}’s next signature.</p>}</> : <><label className="input-label" htmlFor="text-size">{selectedItem.kind === 'text' ? 'Font size' : 'Size'}</label><select id="text-size" value={selectedItem.size} onChange={event => updateItem(selectedItem.id, { size: Number(event.target.value) })}>{[6, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96].map(size => <option key={size} value={size}>{size} pt</option>)}</select></>}<p className="tiny muted">Drag on the page to reposition. Save a workspace to keep placements editable.</p></section>}
             <div className="section-eyebrow">MAKE IT COMPLETE</div><div className="section-heading"><h2>Form fields</h2><span className="pill">{editableCount}</span></div><p className="muted">{editableCount ? 'Fill here or click a field on the page.' : 'This page can still be filled out.'}</p>
             {editableCount > 0 && <><div className="progress-track"><span style={{ width: `${filledCount / editableCount * 100}%` }} /></div><div className="progress-label"><span>{filledCount} of {editableCount} fields have values</span><span>{Math.round(filledCount / editableCount * 100)}%</span></div><label className="toggle-label"><input type="checkbox" checked={highlight} onChange={event => setHighlight(event.target.checked)} /> Highlight fields on page</label><div className="field-filter"><Search size={15} /><input aria-label="Filter form fields" placeholder="Find a field…" value={fieldSearch} onChange={event => setFieldSearch(event.target.value)} /></div></>}
             {fieldList.map(field => <div className="field-editor" key={field.name}><div className="field-label-row"><label htmlFor={undefined}>{field.label}{field.required && <span className="required" title="Required field"> *</span>}</label><button className="page-link" title="Go to this field’s page" onClick={() => setPage(field.page)}>p. {field.page}</button></div><FieldInput field={field} value={state.values[field.name]} onChange={value => changeValue(field.name, value)} disabled={readOnly} />{isDateSignedField(field) && !readOnly && <button className="field-today-button" type="button" onClick={() => changeValue(field.name, formatLocalDate())}>Use today’s date</button>}{field.readOnly && <span className="tiny muted">Read-only</span>}</div>)}

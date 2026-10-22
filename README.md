@@ -18,6 +18,8 @@ Version 1.0.2 includes locally saved signatures and photo import. Long single-li
 
 Saved signatures are kept in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. Signature images are visual marks, not certificate-backed digital signatures.
 
+When you resize a placed saved signature, Paperdesk remembers that width for that signer’s next placement. A smaller signature box still limits the size so the ink fits. This preference stays on this computer with the saved signature.
+
 The app does not save silently. It warns before replacing a document with unsaved edits or closing with changes. **Save** updates an opened workspace; exporting creates a separate PDF and does not mark the draft as saved.
 
 ## Using this chat to help fill forms

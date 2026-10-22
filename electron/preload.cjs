@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('paperdesk', {
   save: data => ipcRenderer.invoke('pdf:save', data),
   listSignatures: () => ipcRenderer.invoke('pdf:signatures-list'),
   saveSignature: record => ipcRenderer.invoke('pdf:signatures-save', record),
+  setSignatureWidth: (signer, width) => ipcRenderer.invoke('pdf:signatures-size', signer, width),
   removeSignature: signer => ipcRenderer.invoke('pdf:signatures-remove', signer),
   setDirty: value => ipcRenderer.send('pdf:dirty', value),
   showOutput: filePath => ipcRenderer.invoke('pdf:show-output', filePath),
