@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog, ipcMain, shell, Menu, protocol, net } = require('electron');
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
@@ -14,10 +15,12 @@ function validSignature(record) {
       !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(record.dataUrl) || record.dataUrl.length > 2_000_000 ||
       !Number.isInteger(record.width) || !Number.isInteger(record.height) ||
       record.width < 1 || record.height < 1 || record.width > 3000 || record.height > 3000) throw new Error('Invalid signature image.');
-  if (record.placementWidth !== undefined && (!Number.isFinite(record.placementWidth) || record.placementWidth < 20 || record.placementWidth > 350)) throw new Error('Invalid saved signature width.');
+  if (record.placementWidth !== undefined && (!Number.isFinite(record.placementWidth) || record.placementWidth < 5 || record.placementWidth > 350)) throw new Error('Invalid saved signature width.');
+  const kind = record.kind ?? 'signature';
+  if (!['signature', 'initials'].includes(kind)) throw new Error('Unknown saved ink type.');
   const png = Buffer.from(record.dataUrl.slice('data:image/png;base64,'.length), 'base64');
   if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('A PNG signature image is required.');
-  return { signer: record.signer, dataUrl: record.dataUrl, width: record.width, height: record.height, ...(record.placementWidth === undefined ? {} : { placementWidth: record.placementWidth }) };
+  return { signer: record.signer, kind, dataUrl: record.dataUrl, width: record.width, height: record.height, ...(record.placementWidth === undefined ? {} : { placementWidth: record.placementWidth }) };
 }
 async function readSignatures() {
   try {
@@ -34,6 +37,13 @@ const fileArguments = args => args.slice(1).filter(arg => /(?:\.pdf|\.paperdesk\
 let pendingPaths = fileArguments(process.argv);
 const reviewSessions = new Map();
 const openedPaths = new Set();
+// An isolated review window can run beside an older Paperdesk build without
+// taking over its single-instance lock. Signature ink stays in appData.
+if (process.argv.includes('--paperdesk-isolated-review')) {
+  const reviewProfile = path.join(app.getPath('appData'), 'Paperdesk PDF Review');
+  fsSync.mkdirSync(reviewProfile, { recursive: true });
+  app.setPath('userData', reviewProfile);
+}
 const lock = app.requestSingleInstanceLock();
 if (!lock) app.quit();
 
@@ -140,28 +150,29 @@ ipcMain.handle('pdf:signatures-list', async event => { validSender(event); retur
 ipcMain.handle('pdf:signatures-save', async (event, record) => {
   validSender(event);
   const existing = await readSignatures();
-  const previous = existing.find(item => item.signer === record?.signer);
+  const kind = record?.kind ?? 'signature';
+  const previous = existing.find(item => item.signer === record?.signer && item.kind === kind);
   const safe = validSignature({ ...record, placementWidth: previous?.placementWidth ?? record?.placementWidth });
-  const records = existing.filter(item => item.signer !== safe.signer);
+  const records = existing.filter(item => item.signer !== safe.signer || item.kind !== safe.kind);
   if (records.length >= 20) throw new Error('Remove a saved signature before adding another.');
   records.push(safe);
   await writeSignatures(records);
   return records;
 });
-ipcMain.handle('pdf:signatures-size', async (event, signer, placementWidth) => {
+ipcMain.handle('pdf:signatures-size', async (event, signer, placementWidth, kind = 'signature') => {
   validSender(event);
-  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80 || !Number.isFinite(placementWidth) || placementWidth < 20 || placementWidth > 350) throw new Error('Invalid saved signature width.');
+  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80 || !['signature', 'initials'].includes(kind) || !Number.isFinite(placementWidth) || placementWidth < 5 || placementWidth > 350) throw new Error('Invalid saved signature width.');
   const records = await readSignatures();
-  const record = records.find(item => item.signer === signer);
+  const record = records.find(item => item.signer === signer && item.kind === kind);
   if (!record) throw new Error('This signature is no longer saved on this computer.');
   record.placementWidth = placementWidth;
   await writeSignatures(records);
   return placementWidth;
 });
-ipcMain.handle('pdf:signatures-remove', async (event, signer) => {
+ipcMain.handle('pdf:signatures-remove', async (event, signer, kind = 'signature') => {
   validSender(event);
-  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80) throw new Error('Unknown signer.');
-  const records = (await readSignatures()).filter(item => item.signer !== signer);
+  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80 || !['signature', 'initials'].includes(kind)) throw new Error('Unknown signer.');
+  const records = (await readSignatures()).filter(item => item.signer !== signer || item.kind !== kind);
   await writeSignatures(records);
   return records;
 });

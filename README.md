@@ -6,17 +6,18 @@ A local Windows Electron app for viewing PDFs, filling standard forms, placing t
 
 For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
 
-Version 1.0.2 includes locally saved signatures and photo import. Long single-line answers fit their fields, short answers remain vertically centered in multiline fields, and existing workspaces remain compatible.
+Version 1.0.4 includes separate locally saved initials, HSEGH caregiver initials targets, and printed-name placement beside flat-form signatures. Existing workspaces remain compatible.
 
 ## Everyday use
 
 1. Click **Open PDF**, or drag a PDF onto the window. **Try a practice form** provides a sample.
 2. Fill existing fields directly on the page or in the Fields panel. Use **Add text** or **Checkmark** on flat/scanned forms. Select an added item to edit it, change its size, or drag it into position.
-3. To sign a fillable signature box, click **Sign here** and choose the saved signer. Paperdesk places the signature and fills the adjacent **Date Signed** field with today's date. The **Today** button also fills a signing date on its own. To create a saved signature, click **Sign**, then draw it or choose **Import a photo**. Each person should review the form and place their own signature.
-4. Click **Save** (or Ctrl+S) while working. An opened `.paperdesk.json` workspace saves back to that same file; the first Save from a PDF asks where to create a workspace. This draft retains the original PDF, field values, and movable additions. Workspace files contain your document and entered information, including placed signature images; store them like the original PDF.
-5. When the form is final, click **Export final PDF**, then **Export flattened PDF**. The Save dialog starts in a **Final PDFs** folder beside the draft, with a `-final.pdf` filename. This makes one share-ready PDF per form. Flattening removes interactive form fields, but does not make a PDF tamper-proof against deliberate editing with PDF software.
+3. To sign a fillable signature box, click **Sign here** and choose the saved signer. Paperdesk places the signature, the printed name when requested, and the signing date. The **Today** button also fills a signing date on its own. To create a saved signature, click **Sign**, then draw it or choose **Import a photo**. Each person should review the form and place their own signature.
+4. To initial a HSEGH report, click **Initial** and have each caregiver draw or import their own initials. Click **Initial** above a caregiver blank at the bottom of a page. Choose **Initial here** for that page, or **All pages** after reviewing the complete report. The form's last page has separate parent signature lines.
+5. Click **Save** (or Ctrl+S) while working. An opened `.paperdesk.json` workspace saves back to that same file; the first Save from a PDF asks where to create a workspace. This draft retains the original PDF, field values, and movable additions. Workspace files contain your document and entered information, including placed signature images; store them like the original PDF.
+6. When the form is final, click **Export final PDF**, then **Export flattened PDF**. The Save dialog starts in a **Final PDFs** folder beside the draft, with a `-final.pdf` filename. This makes one share-ready PDF per form. Flattening removes interactive form fields, but does not make a PDF tamper-proof against deliberate editing with PDF software.
 
-Saved signatures are kept in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. Signature images are visual marks, not certificate-backed digital signatures.
+Saved signatures and initials are kept separately in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. These ink images are visual marks, not certificate-backed digital signatures.
 
 When you resize a placed saved signature, Paperdesk remembers that width for that signer’s next placement. A smaller signature box still limits the size so the ink fits. This preference stays on this computer with the saved signature.
 
@@ -52,7 +53,7 @@ Rotation changes the viewing orientation, not the original page rotation. Text p
 ## Current limits
 
 - Standard AcroForm text, checkbox, radio, dropdown, and list fields are supported. Encrypted PDFs, XFA forms, and documents with existing digital signatures are view-only. PDF scripts and calculations are not executed.
-- Text can be placed over scanned pages, but OCR and automatic detection of blank lines are not included.
+- Text and ink can be placed over scanned pages. OCR is not included. Paperdesk detects some flat signature lines and the caregiver initials footer on Form K-908-2649; other unrecognized lines can be filled with the toolbar tools.
 - No existing-page text editing, page reordering, redaction, certificate signing, or built-in printing in this first version.
 - The bundled Noto Sans font supports many alphabets, but not all scripts or emoji. Export reports unsupported characters instead of silently substituting them. Review long values for fit.
 - Added text, checkmarks, and signatures are permanent in exported PDFs. Retain a workspace for future editing.

@@ -3,6 +3,7 @@ import { AnnotationMode, TextLayer } from 'pdfjs-dist';
 import { Check } from 'lucide-react';
 import { fitFontSize, formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
 import { findFlatSignatureTargets } from './lib/signature-targets.mjs';
+import { findFlatInitialTargets } from './lib/initial-targets.mjs';
 
 function FittingTextInput({ value, style, ...props }) {
   const ref = useRef(null);
@@ -75,7 +76,7 @@ export function Thumbnail({ pdf, pageNumber, current, onClick }) {
   return <button ref={buttonRef} className={`thumbnail ${current ? 'current' : ''}`} aria-label={`Go to page ${pageNumber}`} aria-current={current ? 'page' : undefined} onClick={onClick}><span className="thumbnail-paper"><canvas ref={canvasRef} /></span><span>{pageNumber}</span></button>;
 }
 
-export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSignField, onDateTarget, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
+export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSignField, onInitialField, onDateTarget, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
   const hostRef = useRef(null), canvasRef = useRef(null), textRef = useRef(null), paperRef = useRef(null);
   const [hostWidth, setHostWidth] = useState(700);
   const [ready, setReady] = useState(null);
@@ -115,7 +116,7 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
       if (disposed) return;
       const textContent = await page.getTextContent();
       if (disposed) return;
-      setReady({ viewport, annotations, scale, flatTargets: findFlatSignatureTargets(textContent.items, annotations, number) }); setRendering(false);
+      setReady({ viewport, annotations, scale, flatTargets: findFlatSignatureTargets(textContent.items, annotations, number), initialTargets: findFlatInitialTargets(textContent.items, number) }); setRendering(false);
     };
     render().catch(error => { if (!disposed && error.name !== 'RenderingCancelledException' && error.name !== 'AbortException') { setRendering(false); onError(error.message); } });
     return () => { disposed = true; task?.cancel(); textLayer?.cancel(); };
@@ -129,7 +130,7 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
   }
   function clickPage(event) {
     if (!ready || readOnly || event.target.closest('input, textarea, select, button, .addition')) return;
-    if (tool === 'text' || tool === 'check' || tool === 'date' || tool === 'signature') {
+    if (tool === 'text' || tool === 'check' || tool === 'date' || tool === 'signature' || tool === 'initials') {
       const [x, y] = coordinates(event);
       onPlace({ x, y, page: number, rotation: ready.viewport.rotation });
     } else onSelect(null);
@@ -192,6 +193,12 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
           <div className={`pdf-sign-target flat-sign-target ${signed ? 'is-filled' : ''}`} style={{ left: Math.min(x1, x2), top: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) }}><button type="button" aria-label={`${signed ? 'Change' : 'Sign here'}: ${target.label}, page ${number}`} onClick={event => { event.stopPropagation(); onSignField(target); }}>{signed ? 'Change' : 'Sign here'}</button></div>
           <button type="button" className="flat-date-today" style={{ left: dateLeft, top: dateTop }} title={`${dated ? 'Update' : 'Fill'} signing date with today’s date`} aria-label={`Use today's date: ${target.label}, page ${number}`} onClick={event => { event.stopPropagation(); onDateTarget(target); }}>Today</button>
         </React.Fragment>;
+      })}
+      {ready && !readOnly && ready.initialTargets.map(target => {
+        const [x1, y1] = ready.viewport.convertToViewportPoint(target.rect[0], target.rect[1]);
+        const [x2, y2] = ready.viewport.convertToViewportPoint(target.rect[2], target.rect[3]);
+        const filled = additions.some(item => item.targetField === target.fieldName);
+        return <div key={target.fieldName} className={`pdf-initial-target ${filled ? 'is-filled' : ''}`} style={{ left: Math.min(x1, x2), top: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) }}><button type="button" aria-label={`${filled ? 'Change' : 'Place'} caregiver ${target.slot} initials, page ${number}`} title={`Caregiver ${target.slot} initials on page ${number}`} onClick={event => { event.stopPropagation(); onInitialField(target); }}>{filled ? 'Change' : 'Initial'}</button></div>;
       })}
       {ready && additions.filter(item => item.page === number).map(item => {
         const [left, top] = ready.viewport.convertToViewportPoint(item.x, item.y);

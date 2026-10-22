@@ -32,9 +32,11 @@ test('date on a lower printed-name row pairs with the signature above it', () =>
   const targets = findFlatSignatureTargets(items, [], 39);
   assert.equal(targets.length, 2);
   assert.ok(targets[0].rect[1] > 510);
+  assert.equal(targets[0].rect[1], 523);
   assert.ok(targets[1].rect[3] < 468);
   assert.equal(targets[0].date.y, 499);
   assert.equal(targets[1].date.y, 415);
+  assert.deepEqual(targets[0].printedName, { x: 50, y: 499, label: 'Printed name p39 Signature of prospective adoptive parent: 553' });
 });
 
 test('signature and date captions below blank lines pair once per row', () => {

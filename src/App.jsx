@@ -9,13 +9,16 @@ import { inspectPdf, writePdf, fieldSchema } from './lib/pdf.mjs';
 import { parseBulk, suggestMapping, previewRecord } from './lib/bulk.mjs';
 import { createSample } from './lib/sample.mjs';
 import { formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
-import { preferredSignatureWidth, signatureSizeForField } from './lib/signature-size.mjs';
+import { preferredSignatureWidth, signatureSizeForField, initialSizeForField } from './lib/signature-size.mjs';
+import { findFlatInitialTargets } from './lib/initial-targets.mjs';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 const emptyState = { values: {}, additions: [] };
 const fingerprint = state => JSON.stringify(state);
 const fileStem = name => name.replace(/\.pdf$/i, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
 const signatureSigner = item => item.signer || (item.label?.endsWith(' signature') ? item.label.slice(0, -' signature'.length) : null);
+const inkKind = item => item?.markType === 'initials' || item?.kind === 'initials' ? 'initials' : 'signature';
+const inkKey = (signer, kind) => JSON.stringify([kind, signer]);
 function finalFolder(filePath) {
   if (!filePath) return null;
   const parent = filePath.replace(/[\\/][^\\/]+$/, '');
@@ -124,7 +127,7 @@ export default function App() {
   const additions = state.additions;
   const selectedItem = additions.find(item => item.id === selected);
   const selectedSignatureSigner = selectedItem?.kind === 'signature' ? signatureSigner(selectedItem) : null;
-  const selectedSavedSignature = signatures.find(record => record.signer === selectedSignatureSigner && record.dataUrl === selectedItem?.dataUrl);
+  const selectedSavedSignature = signatures.find(record => record.signer === selectedSignatureSigner && inkKind(record) === inkKind(selectedItem) && record.dataUrl === selectedItem?.dataUrl);
   const allFields = useMemo(() => [...fields.filter(field => !['signature', 'button', 'unsupported'].includes(field.type)), ...additions.filter(item => item.kind === 'text').map(item => ({ name: `Text: ${item.label}`, label: item.label, type: 'text', value: item.text, readOnly: false, options: [] }))], [fields, additions]);
   const labels = additions.filter(item => item.kind === 'text').map(item => item.label.trim().toLowerCase());
   const duplicateNames = labels.some(label => !label) || new Set(labels).size !== labels.length;
@@ -145,43 +148,45 @@ export default function App() {
       .then(setSignatures).catch(error => setError(`Saved signatures could not be loaded: ${error.message}`));
   }, []);
   async function saveSignature(record) {
-    const previous = signatures.find(item => item.signer === record.signer);
+    const previous = signatures.find(item => item.signer === record.signer && inkKind(item) === inkKind(record));
     const replacement = { ...record, ...(previous?.placementWidth === undefined ? {} : { placementWidth: previous.placementWidth }) };
-    const next = window.paperdesk ? await window.paperdesk.saveSignature(replacement) : [...signatures.filter(item => item.signer !== record.signer), replacement];
+    const next = window.paperdesk ? await window.paperdesk.saveSignature(replacement) : [...signatures.filter(item => item.signer !== record.signer || inkKind(item) !== inkKind(record)), replacement];
     if (!window.paperdesk) localStorage.setItem('paperdesk-signatures', JSON.stringify(next));
-    setSignatures(next); notify(`${record.signer}’s signature is saved on this computer.`);
+    setSignatures(next); notify(`${record.signer}’s ${inkKind(record)} ${inkKind(record) === 'initials' ? 'are' : 'is'} saved on this computer.`);
   }
-  function flushSignatureWidth(signer) {
-    const pending = signatureWidthTimers.current.get(signer);
+  function flushSignatureWidth(signer, kind = 'signature') {
+    const key = inkKey(signer, kind);
+    const pending = signatureWidthTimers.current.get(key);
     if (!pending) return;
     clearTimeout(pending.timer);
-    signatureWidthTimers.current.delete(signer);
+    signatureWidthTimers.current.delete(key);
     if (!window.paperdesk) return;
-    signatureWidthWrites.current = signatureWidthWrites.current.catch(() => {}).then(() => window.paperdesk.setSignatureWidth(signer, pending.width));
+    signatureWidthWrites.current = signatureWidthWrites.current.catch(() => {}).then(() => window.paperdesk.setSignatureWidth(signer, pending.width, kind));
     signatureWidthWrites.current.catch(error => setError(`Signature size could not be saved: ${error.message}`));
   }
   function resizeSignature(item, width) {
     updateItem(item.id, { width, height: item.height * width / item.width });
     const signer = signatureSigner(item);
-    const record = signatures.find(saved => saved.signer === signer && saved.dataUrl === item.dataUrl);
+    const kind = inkKind(item), key = inkKey(signer, kind);
+    const record = signatures.find(saved => saved.signer === signer && inkKind(saved) === kind && saved.dataUrl === item.dataUrl);
     if (!record) return;
-    setSignatures(current => current.map(saved => saved.signer === signer ? { ...saved, placementWidth: width } : saved));
-    setActiveSignature(current => current?.signer === signer ? { ...current, placementWidth: width } : current);
+    setSignatures(current => current.map(saved => saved.signer === signer && inkKind(saved) === kind ? { ...saved, placementWidth: width } : saved));
+    setActiveSignature(current => current?.signer === signer && inkKind(current) === kind ? { ...current, placementWidth: width } : current);
     if (!window.paperdesk) {
       const stored = JSON.parse(localStorage.getItem('paperdesk-signatures') || '[]');
-      localStorage.setItem('paperdesk-signatures', JSON.stringify(stored.map(saved => saved.signer === signer ? { ...saved, placementWidth: width } : saved)));
+      localStorage.setItem('paperdesk-signatures', JSON.stringify(stored.map(saved => saved.signer === signer && inkKind(saved) === kind ? { ...saved, placementWidth: width } : saved)));
     } else {
-      clearTimeout(signatureWidthTimers.current.get(signer)?.timer);
-      signatureWidthTimers.current.set(signer, { width, timer: setTimeout(() => flushSignatureWidth(signer), 350) });
+      clearTimeout(signatureWidthTimers.current.get(key)?.timer);
+      signatureWidthTimers.current.set(key, { width, timer: setTimeout(() => flushSignatureWidth(signer, kind), 350) });
     }
   }
-  async function removeSignature(signer) {
+  async function removeSignature(signer, kind = 'signature') {
     try {
-      const next = window.paperdesk ? await window.paperdesk.removeSignature(signer) : signatures.filter(item => item.signer !== signer);
+      const next = window.paperdesk ? await window.paperdesk.removeSignature(signer, kind) : signatures.filter(item => item.signer !== signer || inkKind(item) !== kind);
       if (!window.paperdesk) localStorage.setItem('paperdesk-signatures', JSON.stringify(next));
       setSignatures(next);
-      if (activeSignature?.signer === signer) { setActiveSignature(null); setTool('select'); }
-      notify(`${signer}’s saved signature was removed.`);
+      if (activeSignature?.signer === signer && inkKind(activeSignature) === kind) { setActiveSignature(null); setTool('select'); }
+      notify(`${signer}’s saved ${kind} ${kind === 'initials' ? 'were' : 'was'} removed.`);
     } catch (error) { setError(error.message); }
   }
   useEffect(() => { const beforeUnload = event => { if (dirty && !window.paperdesk) { event.preventDefault(); event.returnValue = ''; } }; window.addEventListener('beforeunload', beforeUnload); return () => window.removeEventListener('beforeunload', beforeUnload); }, [dirty]);
@@ -193,8 +198,8 @@ export default function App() {
     if (!selected) return;
     update(current => {
       const signature = current.additions.find(item => item.id === selected);
-      const pairedDate = signature?.kind === 'signature' && signature.targetField?.startsWith('flat-signature:') ? `${signature.targetField}:date` : null;
-      return { ...current, additions: current.additions.filter(item => item.id !== selected && item.targetField !== pairedDate) };
+      const flatSignature = signature?.kind === 'signature' && signature.targetField?.startsWith('flat-signature:') ? signature.targetField : null;
+      return { ...current, additions: current.additions.filter(item => item.id !== selected && item.targetField !== `${flatSignature}:date` && item.targetField !== `${flatSignature}:printed-name`) };
     });
     setSelected(null);
   }
@@ -226,7 +231,7 @@ export default function App() {
       const fieldObjects = await pdf.getFieldObjects().catch(() => null);
       info.fields = info.fields.map(field => { const widgets = fieldObjects?.get?.(field.name) ?? fieldObjects?.[field.name] ?? []; return { ...field, label: widgets.find(widget => widget.alternativeText)?.alternativeText || field.label, page: widgets.find(widget => widget.page >= 0)?.page + 1 || 1 }; });
       if (restored) {
-        const valid = restored.additions.every(item => ['text', 'check', 'signature'].includes(item.kind) && typeof item.id === 'string' && typeof item.label === 'string' && typeof item.text === 'string' && Number.isFinite(item.x) && Number.isFinite(item.y) && item.page >= 1 && item.page <= pdf.numPages && Number.isInteger(item.page) && item.size >= 6 && item.size <= 96 && [0, 90, 180, 270].includes(item.rotation || 0) && (item.kind !== 'signature' || (typeof item.dataUrl === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(item.dataUrl) && item.dataUrl.length < 2_000_000 && Number.isFinite(item.width) && item.width >= 20 && item.width <= 500 && Number.isFinite(item.height) && item.height >= 1 && item.height <= 500)));
+        const valid = restored.additions.every(item => ['text', 'check', 'signature'].includes(item.kind) && typeof item.id === 'string' && typeof item.label === 'string' && typeof item.text === 'string' && Number.isFinite(item.x) && Number.isFinite(item.y) && item.page >= 1 && item.page <= pdf.numPages && Number.isInteger(item.page) && item.size >= 6 && item.size <= 96 && [0, 90, 180, 270].includes(item.rotation || 0) && (item.kind !== 'signature' || (typeof item.dataUrl === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(item.dataUrl) && item.dataUrl.length < 2_000_000 && Number.isFinite(item.width) && item.width >= 5 && item.width <= 500 && Number.isFinite(item.height) && item.height >= 1 && item.height <= 500 && [undefined, 'signature', 'initials'].includes(item.markType))));
         if (!valid) throw new Error('This workspace has invalid text placements.');
         if (info.readOnlyReason) restored = null;
         else {
@@ -357,10 +362,11 @@ export default function App() {
   }
   function place(position) {
     const id = crypto.randomUUID();
-    if (tool === 'signature') {
+    if (tool === 'signature' || tool === 'initials') {
       if (!activeSignature) return;
       const width = preferredSignatureWidth(activeSignature), height = width * activeSignature.height / activeSignature.width;
-      update(current => ({ ...current, additions: [...current.additions, { id, ...position, kind: 'signature', text: '', label: `${activeSignature.signer} signature`, signer: activeSignature.signer, dataUrl: activeSignature.dataUrl, width, height, size: 12 }] }));
+      const markType = inkKind(activeSignature);
+      update(current => ({ ...current, additions: [...current.additions, { id, ...position, kind: 'signature', markType, text: '', label: `${activeSignature.signer} ${markType}`, signer: activeSignature.signer, dataUrl: activeSignature.dataUrl, width, height, size: 12 }] }));
       setSelected(id); setTool('select'); setTab('fields');
       return;
     }
@@ -383,15 +389,52 @@ export default function App() {
     const boxHeight = Math.abs(y2 - y1);
     const { width, height } = signatureSizeForField(record, target.rect);
     const id = crypto.randomUUID();
-    const item = { id, kind: 'signature', targetField: target.fieldName, page: target.page, x: left + 16, y: top - (boxHeight - height) / 2, text: '', label: `${record.signer} signature`, signer: record.signer, dataUrl: record.dataUrl, width, height, size: 12, rotation: 0 };
+    const item = { id, kind: 'signature', markType: 'signature', targetField: target.fieldName, page: target.page, x: left + 16, y: top - (boxHeight - height) / 2, text: '', label: `${record.signer} signature`, signer: record.signer, dataUrl: record.dataUrl, width, height, size: 12, rotation: 0 };
     const dateField = fields.find(field => field.name === target.dateFieldName);
     const flatDate = target.date && { id: crypto.randomUUID(), kind: 'text', targetField: `${target.fieldName}:date`, page: target.page, x: target.date.x, y: target.date.y, text: formatLocalDate(), label: target.date.label, size: 10, rotation: 0 };
+    const printedName = target.printedName && { id: crypto.randomUUID(), kind: 'text', targetField: `${target.fieldName}:printed-name`, page: target.page, x: target.printedName.x, y: target.printedName.y, text: record.signer, label: target.printedName.label, size: 10, rotation: 0 };
     update(current => ({
       values: isDateSignedField(dateField) && !current.values[target.dateFieldName] ? { ...current.values, [target.dateFieldName]: formatLocalDate() } : current.values,
-      additions: [...current.additions.filter(existing => (existing.targetField !== target.fieldName && existing.targetField !== `${target.fieldName}:date`) || existing.page !== target.page), item, ...(flatDate ? [flatDate] : [])],
+      additions: [...current.additions.filter(existing => (existing.targetField !== target.fieldName && existing.targetField !== `${target.fieldName}:date` && existing.targetField !== `${target.fieldName}:printed-name`) || existing.page !== target.page), item, ...(flatDate ? [flatDate] : []), ...(printedName ? [printedName] : [])],
     }));
     setSelected(id); setPage(target.page); setTool('select'); setActiveSignature(null); setSignTarget(null); setModal(null);
     notify(`${record.signer}’s signature was placed${flatDate || isDateSignedField(dateField) ? ' and the signing date was filled' : ''}. Review it before saving.`);
+  }
+  function initialAddition(record, target) {
+    const [x1, y1, x2, y2] = target.rect;
+    const left = Math.min(x1, x2), top = Math.max(y1, y2);
+    const { width, height } = initialSizeForField(record, target.rect);
+    return { id: crypto.randomUUID(), kind: 'signature', markType: 'initials', targetField: target.fieldName, page: target.page,
+      x: left + (Math.abs(x2 - x1) - width) / 2, y: top - (Math.abs(y2 - y1) - height) / 2,
+      text: '', label: `${record.signer} initials`, signer: record.signer, dataUrl: record.dataUrl, width, height, size: 12, rotation: 0 };
+  }
+  function placeInitialInField(record, target) {
+    try {
+      const item = initialAddition(record, target);
+      update(current => ({ ...current, additions: [...current.additions.filter(existing => existing.targetField !== target.fieldName), item] }));
+      setSelected(item.id); setPage(target.page); setTool('select'); setActiveSignature(null); setSignTarget(null); setModal(null);
+      notify(`${record.signer}’s initials were placed in caregiver space ${target.slot} on page ${target.page}. Review the placement before saving.`);
+    } catch (cause) { setError(cause.message); }
+  }
+  async function placeInitialsOnAllPages(record, target) {
+    if (!documentState) return;
+    setBusy('Finding caregiver initials on every page…');
+    try {
+      const targets = [];
+      for (let number = 1; number <= documentState.pdf.numPages; number++) {
+        const pdfPage = await documentState.pdf.getPage(number);
+        const content = await pdfPage.getTextContent();
+        const found = findFlatInitialTargets(content.items, number).find(item => item.slot === target.slot);
+        if (!found) throw new Error(`Page ${number} has no matching caregiver initials line. No initials were added.`);
+        targets.push(found);
+      }
+      const names = new Set(targets.map(item => item.fieldName));
+      const items = targets.map(item => initialAddition(record, item));
+      update(current => ({ ...current, additions: [...current.additions.filter(existing => !names.has(existing.targetField)), ...items] }));
+      setSelected(null); setTool('select'); setActiveSignature(null); setSignTarget(null); setModal(null);
+      notify(`${record.signer}’s initials were placed in caregiver space ${target.slot} on all ${targets.length} pages. Review before saving.`);
+    } catch (cause) { setError(cause.message); }
+    finally { setBusy(''); }
   }
   function fillFlatSigningDate(target) {
     const fieldName = `${target.fieldName}:date`;
@@ -410,18 +453,18 @@ export default function App() {
       <div className="welcome-art" aria-hidden="true"><div className="paper-back" /><div className="illustration-paper"><div className="mini-brand"><span /> PAPERDESK</div><div className="paper-title">Goodbye, busywork.</div><div className="paper-subtitle">Hello, done.</div><div className="illustration-rule" /><div className="mock-label">FULL NAME</div><div className="mock-field">Jamie Parker<span className="caret" /></div><div className="mock-two"><div><div className="mock-label">YOUR EMAIL</div><div className="mock-line" /></div><div><div className="mock-label">DATE</div><div className="mock-line short" /></div></div><div className="mock-checkbox"><span><Check size={13} /></span> A much better way to PDF.</div><div className="mock-signature">All taken care of.</div><div className="paper-bottom">ONE LESS THING ON YOUR LIST <span>01</span></div></div><div className="floating-chip"><CheckCircle2 size={20} /><span>Filled, saved, sorted.</span></div><div className="annotation-chip"><Sparkles size={14} /> A helping hand, built in</div></div>
       <div className="welcome-features"><div><span className="feature-icon"><FileText size={20} /></span><section><h3>Read comfortably</h3><p>A clear view. Every page, every detail.</p></section></div><div><span className="feature-icon"><Type size={20} /></span><section><h3>Fill any layout</h3><p>Use form fields or add your own text.</p></section></div><div><span className="feature-icon"><Layers size={20} /></span><section><h3>Skip the repetitive bits</h3><p>Paste your details and fill in bulk.</p></section></div></div>
     </main> : <>
-      <div className="toolbar"><div className="toolbar-group"><button className="icon-button" title="Toggle page thumbnails" aria-label="Toggle page thumbnails" onClick={() => setShowPages(!showPages)}>{showPages ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button><span className="toolbar-divider" /><button className={`tool-button ${tool === 'select' ? 'active' : ''}`} onClick={() => setTool('select')}><MousePointer2 size={16} /> Select</button><button className={`tool-button ${tool === 'text' ? 'active' : ''}`} onClick={() => setTool('text')} disabled={readOnly}><Type size={17} /> Add text</button><button className={`tool-button ${tool === 'check' ? 'active' : ''}`} onClick={() => setTool('check')} disabled={readOnly}><Check size={17} /> Checkmark</button><button className={`tool-button ${tool === 'date' ? 'active' : ''}`} onClick={() => setTool('date')} disabled={readOnly}><CalendarDays size={17} /> Date</button><button className={`tool-button ${tool === 'signature' ? 'active' : ''}`} onClick={() => { setSignTarget(null); setModal('signatures'); }} disabled={readOnly}><PenLine size={17} /> Sign</button><span className="toolbar-divider" /><button className="icon-button" title="Undo (Ctrl+Z)" aria-label="Undo" disabled={!history.past.length} onClick={undo}><Undo2 size={17} /></button><button className="icon-button" title="Redo (Ctrl+Y)" aria-label="Redo" disabled={!history.future.length} onClick={redo}><Redo2 size={17} /></button></div>
+      <div className="toolbar"><div className="toolbar-group"><button className="icon-button" title="Toggle page thumbnails" aria-label="Toggle page thumbnails" onClick={() => setShowPages(!showPages)}>{showPages ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button><span className="toolbar-divider" /><button className={`tool-button ${tool === 'select' ? 'active' : ''}`} onClick={() => setTool('select')}><MousePointer2 size={16} /> Select</button><button className={`tool-button ${tool === 'text' ? 'active' : ''}`} onClick={() => setTool('text')} disabled={readOnly}><Type size={17} /> Add text</button><button className={`tool-button ${tool === 'check' ? 'active' : ''}`} onClick={() => setTool('check')} disabled={readOnly}><Check size={17} /> Checkmark</button><button className={`tool-button ${tool === 'date' ? 'active' : ''}`} onClick={() => setTool('date')} disabled={readOnly}><CalendarDays size={17} /> Date</button><button className={`tool-button ${tool === 'signature' ? 'active' : ''}`} onClick={() => { setSignTarget(null); setModal('signatures'); }} disabled={readOnly}><PenLine size={17} /> Sign</button><button className={`tool-button ${tool === 'initials' ? 'active' : ''}`} onClick={() => { setSignTarget(null); setModal('initials'); }} disabled={readOnly}><PenLine size={17} /> Initial</button><span className="toolbar-divider" /><button className="icon-button" title="Undo (Ctrl+Z)" aria-label="Undo" disabled={!history.past.length} onClick={undo}><Undo2 size={17} /></button><button className="icon-button" title="Redo (Ctrl+Y)" aria-label="Redo" disabled={!history.future.length} onClick={redo}><Redo2 size={17} /></button></div>
       <div className="toolbar-group zoom-controls"><button className="icon-button" aria-label="Zoom out" onClick={() => setZoom(Math.max(0.25, (zoom === 'fit' ? 1 : Number(zoom)) - 0.25))}><Minus size={16} /></button><select aria-label="Zoom" value={zoom} onChange={event => setZoom(event.target.value === 'fit' ? 'fit' : Number(event.target.value))}>{[0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3].map(value => <option key={value} value={value}>{Math.round(value * 100)}%</option>)}<option value="fit">Fit width</option></select><button className="icon-button" aria-label="Zoom in" onClick={() => setZoom(Math.min(3, (zoom === 'fit' ? 1 : Number(zoom)) + 0.25))}><Plus size={16} /></button><button className="icon-button" title="Fit width" aria-label="Fit width" onClick={() => setZoom('fit')}><Maximize size={16} /></button><button className="icon-button" title="Rotate view (does not change saved PDF)" aria-label="Rotate view" onClick={() => setRotation((rotation + 90) % 360)}><RotateCw size={16} /></button></div>
       <div className="toolbar-group page-controls"><button className="icon-button" aria-label="Previous page" disabled={page <= 1} onClick={() => setPage(page - 1)}><ChevronLeft size={17} /></button><input aria-label="Page number" type="number" min={1} max={documentState.pdf.numPages} value={page} onChange={event => { const value = Number(event.target.value); if (value >= 1 && value <= documentState.pdf.numPages) setPage(value); }} /><span>/ {documentState.pdf.numPages}</span><button className="icon-button" aria-label="Next page" disabled={page >= documentState.pdf.numPages} onClick={() => setPage(page + 1)}><ChevronRight size={17} /></button></div></div>
       {documentState.readOnlyReason && <div className="document-warning"><LockKeyhole size={15} />{documentState.readOnlyReason}</div>}
-      {tool !== 'select' && <div className="placement-hint"><MousePointer2 size={14} /> Click on the page to place {tool === 'text' ? 'a text box' : tool === 'check' ? 'a checkmark' : tool === 'date' ? 'today’s date' : `${activeSignature?.signer || 'the'} signature`}. <button onClick={() => setTool('select')}>Cancel</button></div>}
+      {tool !== 'select' && <div className="placement-hint"><MousePointer2 size={14} /> Click on the page to place {tool === 'text' ? 'a text box' : tool === 'check' ? 'a checkmark' : tool === 'date' ? 'today’s date' : `${activeSignature?.signer || 'the'} ${tool === 'initials' ? 'initials' : 'signature'}`}. <button onClick={() => setTool('select')}>Cancel</button></div>}
       <main className={`editor ${showPages ? '' : 'pages-hidden'}`}>
         {showPages && <aside className="pages-sidebar"><div className="sidebar-heading"><span>PAGES</span><span>{documentState.pdf.numPages}</span></div><div className="thumbnails">{Array.from({ length: documentState.pdf.numPages }, (_, index) => <Thumbnail key={`${documentState.id}-${index}`} pdf={documentState.pdf} pageNumber={index + 1} current={page === index + 1} onClick={() => setPage(index + 1)} />)}</div></aside>}
-        <PdfPage pdf={documentState.pdf} number={page} zoom={zoom} rotation={rotation} fields={fields} values={state.values} additions={additions} tool={tool} onChange={changeValue} onPlace={place} onSignField={target => { if (tool === 'signature' && activeSignature) placeSignatureInField(activeSignature, target); else { setSignTarget(target); setTool('select'); setModal('signatures'); } }} onDateTarget={fillFlatSigningDate} onSelect={setSelected} onMove={updateItem} selected={selected} highlight={highlight} readOnly={readOnly} query={tab === 'search' ? search.trim() : ''} onError={setError} />
+        <PdfPage pdf={documentState.pdf} number={page} zoom={zoom} rotation={rotation} fields={fields} values={state.values} additions={additions} tool={tool} onChange={changeValue} onPlace={place} onSignField={target => { if (tool === 'signature' && activeSignature) placeSignatureInField(activeSignature, target); else { setSignTarget(target); setTool('select'); setModal('signatures'); } }} onInitialField={target => { if (tool === 'initials' && activeSignature) placeInitialInField(activeSignature, target); else { setSignTarget(target); setTool('select'); setModal('initials'); } }} onDateTarget={fillFlatSigningDate} onSelect={setSelected} onMove={updateItem} selected={selected} highlight={highlight} readOnly={readOnly} query={tab === 'search' ? search.trim() : ''} onError={setError} />
         <aside className="inspector"><div className="panel-tabs" role="tablist" aria-label="Document tools"><button role="tab" aria-selected={tab === 'fields'} className={tab === 'fields' ? 'active' : ''} onClick={() => setTab('fields')}><List size={16} /> Fields</button><button role="tab" aria-selected={tab === 'bulk'} className={tab === 'bulk' ? 'active' : ''} onClick={() => setTab('bulk')} disabled={readOnly}><Sparkles size={16} /> Bulk fill</button><button role="tab" aria-selected={tab === 'search'} className={tab === 'search' ? 'active search-tab' : 'search-tab'} onClick={() => setTab('search')} title="Find text (Ctrl+F)" aria-label="Find text"><Search size={17} /></button></div>
           <BulkPanel key={documentState.id} active={tab === 'bulk'} fields={allFields} busy={Boolean(busy)} duplicateNames={duplicateNames} onApply={values => { update(current => applyValues(values, current)); notify(`${Object.keys(values).length} field values applied. Review the page before saving.`); }} onBatch={batch} onCopy={copySchema} />
           {tab === 'search' ? <div className="panel-body"><div className="section-eyebrow">FIND YOUR PLACE</div><h2>Search this PDF</h2><form onSubmit={findText} className="search-form"><input id="document-search" aria-label="Search document text" placeholder="Find a word or phrase…" value={search} onChange={event => { setSearch(event.target.value); setSearchResults([]); searchRun.current++; setSearching(false); }} /><button className="primary" disabled={searching || !search.trim()} aria-label="Search"><Search size={16} /></button></form><p className="tiny muted">Searches existing document text. Scanned images need OCR, which this version does not include.</p>{searching ? <p className="muted">Searching pages…</p> : <><div className="section-heading"><h3>Matching pages</h3><span className="pill">{searchResults.length}</span></div>{searchResults.map(result => <button key={result.page} className="search-result" onClick={() => setPage(result.page)}><strong>Page {result.page}</strong><span>{result.snippet}</span></button>)}</>}</div> : tab === 'fields' ? <div className="panel-body fields-panel">
-            {selectedItem && <section className="added-editor"><div className="section-heading"><h3>{selectedItem.kind === 'text' ? 'Your text box' : selectedItem.kind === 'signature' ? selectedItem.label : 'Your checkmark'}</h3><button className="icon-button" aria-label="Delete selected item" onClick={() => { removeSelected(); }}><Trash2 size={16} /></button></div>{selectedItem.kind === 'text' && <><label className="input-label" htmlFor="added-text-value">Text</label><textarea id="added-text-value" rows={3} value={selectedItem.text} onChange={event => updateItem(selectedItem.id, { text: event.target.value })} /><label className="input-label" htmlFor="added-text-label">Field name <span>for bulk filling</span></label><input id="added-text-label" value={selectedItem.label} onChange={event => updateItem(selectedItem.id, { label: event.target.value })} /></>}{selectedItem.kind === 'signature' ? <><label className="input-label" htmlFor="signature-width">Signature width</label><input id="signature-width" type="range" min="20" max="350" value={selectedItem.width} onChange={event => resizeSignature(selectedItem, Number(event.target.value))} onPointerUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} onKeyUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} onBlur={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner)} /><span className="tiny muted">{Math.round(selectedItem.width)} pt wide</span>{selectedSavedSignature && <p className="tiny muted">This size is saved for {selectedSignatureSigner}’s next signature.</p>}</> : <><label className="input-label" htmlFor="text-size">{selectedItem.kind === 'text' ? 'Font size' : 'Size'}</label><select id="text-size" value={selectedItem.size} onChange={event => updateItem(selectedItem.id, { size: Number(event.target.value) })}>{[6, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96].map(size => <option key={size} value={size}>{size} pt</option>)}</select></>}<p className="tiny muted">Drag on the page to reposition. Save a workspace to keep placements editable.</p></section>}
+            {selectedItem && <section className="added-editor"><div className="section-heading"><h3>{selectedItem.kind === 'text' ? 'Your text box' : selectedItem.kind === 'signature' ? selectedItem.label : 'Your checkmark'}</h3><button className="icon-button" aria-label="Delete selected item" onClick={() => { removeSelected(); }}><Trash2 size={16} /></button></div>{selectedItem.kind === 'text' && <><label className="input-label" htmlFor="added-text-value">Text</label><textarea id="added-text-value" rows={3} value={selectedItem.text} onChange={event => updateItem(selectedItem.id, { text: event.target.value })} /><label className="input-label" htmlFor="added-text-label">Field name <span>for bulk filling</span></label><input id="added-text-label" value={selectedItem.label} onChange={event => updateItem(selectedItem.id, { label: event.target.value })} /></>}{selectedItem.kind === 'signature' ? <><label className="input-label" htmlFor="signature-width">{inkKind(selectedItem) === 'initials' ? 'Initials width' : 'Signature width'}</label><input id="signature-width" type="range" min={inkKind(selectedItem) === 'initials' ? 5 : 20} max="350" value={selectedItem.width} onChange={event => resizeSignature(selectedItem, Number(event.target.value))} onPointerUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} onKeyUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} onBlur={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} /><span className="tiny muted">{Math.round(selectedItem.width)} pt wide</span>{selectedSavedSignature && <p className="tiny muted">This size is saved for {selectedSignatureSigner}’s next {inkKind(selectedItem)}.</p>}</> : <><label className="input-label" htmlFor="text-size">{selectedItem.kind === 'text' ? 'Font size' : 'Size'}</label><select id="text-size" value={selectedItem.size} onChange={event => updateItem(selectedItem.id, { size: Number(event.target.value) })}>{[6, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96].map(size => <option key={size} value={size}>{size} pt</option>)}</select></>}<p className="tiny muted">Drag on the page to reposition. Save a workspace to keep placements editable.</p></section>}
             <div className="section-eyebrow">MAKE IT COMPLETE</div><div className="section-heading"><h2>Form fields</h2><span className="pill">{editableCount}</span></div><p className="muted">{editableCount ? 'Fill here or click a field on the page.' : 'This page can still be filled out.'}</p>
             {editableCount > 0 && <><div className="progress-track"><span style={{ width: `${filledCount / editableCount * 100}%` }} /></div><div className="progress-label"><span>{filledCount} of {editableCount} fields have values</span><span>{Math.round(filledCount / editableCount * 100)}%</span></div><label className="toggle-label"><input type="checkbox" checked={highlight} onChange={event => setHighlight(event.target.checked)} /> Highlight fields on page</label><div className="field-filter"><Search size={15} /><input aria-label="Filter form fields" placeholder="Find a field…" value={fieldSearch} onChange={event => setFieldSearch(event.target.value)} /></div></>}
             {fieldList.map(field => <div className="field-editor" key={field.name}><div className="field-label-row"><label htmlFor={undefined}>{field.label}{field.required && <span className="required" title="Required field"> *</span>}</label><button className="page-link" title="Go to this field’s page" onClick={() => setPage(field.page)}>p. {field.page}</button></div><FieldInput field={field} value={state.values[field.name]} onChange={value => changeValue(field.name, value)} disabled={readOnly} />{isDateSignedField(field) && !readOnly && <button className="field-today-button" type="button" onClick={() => changeValue(field.name, formatLocalDate())}>Use today’s date</button>}{field.readOnly && <span className="tiny muted">Read-only</span>}</div>)}
@@ -432,11 +475,11 @@ export default function App() {
         </aside>
       </main>
     </>}
-    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : 'Changes are saved only when you choose Save'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.0.3</>}</span></footer>
+    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : 'Changes are saved only when you choose Save'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.0.4</>}</span></footer>
     {dragging && <div className="drop-overlay"><FileText size={48} /><h2>Drop it here. We’ll take it from there.</h2><p>PDF or Paperdesk workspace</p></div>}
     {toast && <div className="toast" role="status"><CheckCircle2 size={19} /><span>{toast.message}</span>{toast.path && <button onClick={() => window.paperdesk?.showOutput(toast.path)}>Show file</button>}<button className="icon-button" aria-label="Dismiss notification" onClick={() => setToast(null)}><X size={16} /></button></div>}
-    {modal === 'signatures' && <SignatureDialog signatures={signatures} target={signTarget} onSave={saveSignature} onRemove={removeSignature} onPlace={record => { if (signTarget) placeSignatureInField(record, signTarget); else { setActiveSignature(record); setTool('signature'); setModal(null); } }} onClose={() => { setModal(null); setSignTarget(null); }} />}
-    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content"><p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Fillable fields appear in the right panel.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature and fills its signing date. Use Today beside a signing date to set it separately. For a scanned page without detected text, use Sign and Date in the toolbar and click the two spots. Review both before saving.</p><p><b>4. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>5. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF to put one flattened PDF in the Final PDFs folder beside your source file. A CSV or JSON array can produce one filled PDF per record.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures. It does not include OCR, certificate signing, or editing existing page text. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
+    {(modal === 'signatures' || modal === 'initials') && <SignatureDialog signatures={signatures} kind={modal === 'initials' ? 'initials' : 'signature'} target={signTarget} pageCount={documentState?.pdf.numPages || 1} onSave={saveSignature} onRemove={removeSignature} onPlace={record => { if (signTarget) modal === 'initials' ? placeInitialInField(record, signTarget) : placeSignatureInField(record, signTarget); else { setActiveSignature(record); setTool(modal === 'initials' ? 'initials' : 'signature'); setModal(null); } }} onPlaceAll={record => placeInitialsOnAllPages(record, signTarget)} onClose={() => { setModal(null); setSignTarget(null); }} />}
+    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content"><p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Fillable fields appear in the right panel.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature, printed name where requested, and signing date. Use Today beside a signing date to set it separately. Review before saving.</p><p><b>4. Initial reports.</b> Click Initial in the toolbar to draw or import each person's initials. On a HSEGH page, click Initial above either caregiver blank. Choose Initial here for that page, or All pages after you have reviewed the complete report. Each person's initials are saved separately from their full signature.</p><p><b>5. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>6. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF to put one flattened PDF in the Final PDFs folder beside your source file. A CSV or JSON array can produce one filled PDF per record.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures and initials. It does not include OCR, certificate signing, or editing existing page text. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
     {modal === 'export' && <Modal title={readOnly ? 'Save a PDF copy' : 'Export final PDF'} onClose={busy ? null : () => setModal(null)}>
       <p className="muted">{readOnly ? 'This file is view-only. Save a separate PDF copy.' : 'Create one finished PDF for this form, with answers and signatures fixed on the page.'}</p>
       {!readOnly && <><div className="notice small"><b>Finals folder:</b> <code className="final-folder">{finalFolder(documentState.sourcePath) || 'Choose a folder in the Save dialog'}</code></div><p className="tiny muted">Flattening removes editable form fields. Another PDF editor could still change the file.</p></>}

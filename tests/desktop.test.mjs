@@ -22,8 +22,9 @@ async function desktopHarness(argv = ['electron', root]) {
     on(name, handler) { this.listeners.set(name, handler); }
     loadURL(url) { this.loadedURL = url; }
   }
+  const appPaths = new Map();
   const electron = {
-    app: { requestSingleInstanceLock: () => true, quit() {}, on() {}, whenReady: () => Promise.resolve(), isPackaged: true, getPath: () => path.join(root, 'tmp/qa/signature-size-app') },
+    app: { requestSingleInstanceLock: () => true, quit() {}, on() {}, whenReady: () => Promise.resolve(), isPackaged: true, getPath: name => appPaths.get(name) || path.join(root, 'tmp/qa/signature-size-app'), setPath: (name, value) => appPaths.set(name, value) },
     BrowserWindow: WindowMock, dialog,
     ipcMain: { handle: (name, handler) => handlers.set(name, handler), on: (name, handler) => listeners.set(name, handler) },
     Menu: { setApplicationMenu() {} }, shell: { showItemInFolder() {} },
@@ -33,7 +34,7 @@ async function desktopHarness(argv = ['electron', root]) {
   const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Buffer, Uint8Array, Response, URL });
   vm.runInContext(await readFile(path.join(root, 'electron/main.cjs'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
-  return { handlers, listeners, protocols, dialog, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
+  return { handlers, listeners, protocols, dialog, appPaths, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
 }
 
 test('desktop loads only local assets with sandboxed, isolated renderer', async () => {
@@ -106,6 +107,11 @@ test('desktop review queue preserves argument order and opens each file on deman
   await assert.rejects(() => h.handlers.get('pdf:review-file')({ sender: {} }, initial.review.id, 0), /Unknown caller/);
 });
 
+test('isolated review window uses its own single-instance profile', async () => {
+  const h = await desktopHarness(['electron', root, '--paperdesk-isolated-review']);
+  assert.equal(h.appPaths.get('userData'), path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF Review'));
+});
+
 test('closing with unsaved edits can be cancelled', async () => {
   const h = await desktopHarness();
   h.listeners.get('pdf:dirty')(h.event, true);
@@ -134,4 +140,23 @@ test('signature widths persist per signer without changing the ink image', async
   await save(h.event, { signer: 'Signer One', dataUrl, width: 800, height: 200, placementWidth: 100 });
   assert.equal((await h.handlers.get('pdf:signatures-list')(h.event)).find(item => item.signer === 'Signer One').placementWidth, 56);
   await assert.rejects(() => h.handlers.get('pdf:signatures-size')(h.event, 'Signer One', 500), /Invalid saved signature width/);
+});
+
+test('a person can save initials separately from their full signature', async () => {
+  const signatureFile = path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF/signatures.json');
+  await mkdir(path.dirname(signatureFile), { recursive: true });
+  await writeFile(signatureFile, '[]');
+  const h = await desktopHarness();
+  const dataUrl = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64')}`;
+  const save = h.handlers.get('pdf:signatures-save');
+  await save(h.event, { signer: 'Sample Signer', dataUrl, width: 800, height: 200 });
+  await save(h.event, { signer: 'Sample Signer', kind: 'initials', dataUrl, width: 80, height: 40 });
+  await h.handlers.get('pdf:signatures-size')(h.event, 'Sample Signer', 22, 'initials');
+  let records = await h.handlers.get('pdf:signatures-list')(h.event);
+  assert.equal(records.length, 2);
+  assert.equal(records.find(item => item.kind === 'signature').placementWidth, undefined);
+  assert.equal(records.find(item => item.kind === 'initials').placementWidth, 22);
+  await h.handlers.get('pdf:signatures-remove')(h.event, 'Sample Signer', 'initials');
+  records = await h.handlers.get('pdf:signatures-list')(h.event);
+  assert.deepEqual(Array.from(records, item => item.kind), ['signature']);
 });

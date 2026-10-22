@@ -33,8 +33,9 @@ export function findFlatSignatureTargets(items, annotations = [], page = 1) {
     if (!match) continue;
     const { date, index, gap } = match;
     const line = caption ? text.find(item => /^_{5,}$/.test(item.text) && item.x <= label.x && item.x + item.width >= label.x && item.y > label.y + 5 && item.y < label.y + 26) : null;
-    const top = line ? line.y + 22 : label.y - 10;
-    const bottom = line ? line.y + 1 : label.y - 37;
+    const lowerNameRow = !line && gap > 25;
+    const top = line ? line.y + 22 : lowerNameRow ? label.y - 9 : label.y - 10;
+    const bottom = line ? line.y + 1 : lowerNameRow ? date.y + 13 : label.y - 37;
     const left = line ? line.x + 2 : label.x + (label.text.startsWith('Signature') ? 16 : 16);
     const right = Math.min(date.x - 7, line ? line.x + line.width : date.x - 7);
     const rect = [left, bottom, right, top];
@@ -45,6 +46,9 @@ export function findFlatSignatureTargets(items, annotations = [], page = 1) {
     usedDates.add(index);
     targets.push({ fieldName: `flat-signature:${page}:${Math.round(label.x)}:${Math.round(label.y)}`, page, rect, label: label.text,
       date: { x: date.x + 8, y: line ? line.y + 16 : date.y - 11, label: `Signing date p${page} ${label.text} ${Math.round(label.y)}` },
+      printedName: text.some(item => /^printed name\s*:?$/i.test(item.text) && Math.abs(item.y - date.y) < 3 && item.x < date.x)
+        ? { x: label.x + 8, y: date.y - 11, label: `Printed name p${page} ${label.text} ${Math.round(label.y)}` }
+        : null,
     });
   }
   return targets;

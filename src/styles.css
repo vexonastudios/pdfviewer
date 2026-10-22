@@ -33,3 +33,10 @@
 .flat-date-today{position:absolute;z-index:5;padding:2px 4px;background:#f5faf4ec;color:#355d45;border:1px solid #a5b9a7;border-radius:3px;font:600 9px Inter,sans-serif;line-height:1.2}.flat-date-today:hover{background:#e0efdf}
 .tool-date,.tool-signature{cursor:crosshair}.tool-date .textLayer,.tool-signature .textLayer{pointer-events:none}
 .final-folder{display:block;margin-top:6px;overflow-wrap:anywhere;color:#314e3b}
+.tool-initials{cursor:crosshair}.tool-initials .textLayer{pointer-events:none}
+.pdf-initial-target{position:absolute;z-index:5;display:flex;align-items:center;justify-content:center;pointer-events:none}
+.pdf-initial-target button{pointer-events:auto;padding:2px 3px;background:#f5faf4ed;color:#355d45;border:1px solid #a5b9a7;border-radius:3px;font:600 8px Inter,sans-serif;white-space:nowrap;box-shadow:0 1px 3px #253f2920}
+.pdf-initial-target button:hover,.pdf-initial-target button:focus-visible{background:#dcebdc}
+.pdf-initial-target.is-filled button{position:absolute;left:0;bottom:100%;opacity:0}
+.pdf-initial-target.is-filled:hover button,.pdf-initial-target.is-filled button:focus-visible{opacity:1}
+.signature-card .secondary{min-height:31px;padding:6px 8px;font-size:10px}

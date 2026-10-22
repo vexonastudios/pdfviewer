@@ -1,6 +1,15 @@
 export function preferredSignatureWidth(record) {
-  if (Number.isFinite(record.placementWidth) && record.placementWidth >= 20 && record.placementWidth <= 350) return record.placementWidth;
+  if (Number.isFinite(record.placementWidth) && record.placementWidth >= 5 && record.placementWidth <= 350) return record.placementWidth;
+  if (record.kind === 'initials') return Math.max(5, Math.min(32, 16 * record.width / record.height));
   return Math.min(160, 80 * record.width / record.height);
+}
+
+export function initialSizeForField(record, rect) {
+  const boxWidth = Math.abs(rect[2] - rect[0]);
+  const boxHeight = Math.abs(rect[3] - rect[1]);
+  const width = Math.min(preferredSignatureWidth(record), boxWidth - 2, (boxHeight - 2) * record.width / record.height);
+  if (width < 5) throw new Error('These initials are too narrow to fit this line. Draw or import a wider mark.');
+  return { width, height: width * record.height / record.width };
 }
 
 export function signatureSizeForField(record, rect) {

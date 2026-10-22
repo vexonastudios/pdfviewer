@@ -90,6 +90,7 @@ export async function writePdf(original, fields, values, additions = [], { flatt
   }
   // Draw movable additions after flattening so a form widget cannot paint over
   // a signature or text placed within its rectangle.
+  const inkImages = new Map();
   for (const addition of additions) {
     const page = doc.getPage(addition.page - 1);
     const color = rgb(0.10, 0.16, 0.22);
@@ -104,7 +105,8 @@ export async function writePdf(original, fields, values, additions = [], { flatt
       });
     } else if (addition.kind === 'signature') {
       if (!/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(addition.dataUrl || '') || addition.dataUrl.length > 2_000_000 || !(addition.width > 0 && addition.width <= 500) || !(addition.height > 0 && addition.height <= 500)) throw new Error('A placed signature is invalid.');
-      const image = await doc.embedPng(addition.dataUrl);
+      let image = inkImages.get(addition.dataUrl);
+      if (!image) { image = await doc.embedPng(addition.dataUrl); inkImages.set(addition.dataUrl, image); }
       const angle = (addition.rotation || 0) * Math.PI / 180;
       page.drawImage(image, { x: addition.x + Math.sin(angle) * addition.height, y: addition.y - Math.cos(angle) * addition.height, width: addition.width, height: addition.height, rotate: degrees(addition.rotation || 0) });
     } else if (addition.kind === 'check') {
