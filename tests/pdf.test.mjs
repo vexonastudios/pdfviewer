@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { PDFDocument, PDFName, PDFDict, degrees } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFDict, decodePDFRawStream, degrees } from 'pdf-lib';
 import { createSample } from '../src/lib/sample.mjs';
 import { inspectPdf, writePdf } from '../src/lib/pdf.mjs';
 
@@ -120,6 +120,26 @@ test('square checkboxes render a font-independent check mark', async () => {
   const normal = widget.dict.lookup(PDFName.of('AP'), PDFDict).lookup(PDFName.of('N'), PDFDict);
   const on = normal.lookup(widget.getOnValue());
   assert.equal(on.dict.get(PDFName.of('Resources')), undefined);
+});
+test('font-based checkbox without an appearance caption still prints its check mark', async () => {
+  const doc = await PDFDocument.create(); const page = doc.addPage();
+  const box = doc.getForm().createCheckBox('Information sheet received');
+  box.addToPage(page, { x: 50, y: 650, width: 12, height: 12 });
+  const widget = box.acroField.getWidgets()[0];
+  const normal = widget.dict.lookup(PDFName.of('AP'), PDFDict).lookup(PDFName.of('N'), PDFDict);
+  const onValue = widget.getOnValue();
+  const legacy = doc.context.flateStream('0 g\nBT\n/ZaDb 8 Tf\n2 2 Td\n(4) Tj\nET\n', { Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 12, 12] });
+  normal.set(onValue, doc.context.register(legacy));
+  widget.dict.lookup(PDFName.of('MK'), PDFDict)?.delete(PDFName.of('CA'));
+  const bytes = await doc.save(); const { fields } = await inspectPdf(bytes);
+  const reopened = await PDFDocument.load(await writePdf(bytes, fields, { 'Information sheet received': true }, [], { fontBytes }));
+  const filled = reopened.getForm().getCheckBox('Information sheet received');
+  assert.equal(filled.isChecked(), true);
+  const filledWidget = filled.acroField.getWidgets()[0];
+  const appearance = filledWidget.dict.lookup(PDFName.of('AP'), PDFDict).lookup(PDFName.of('N'), PDFDict).lookup(filledWidget.getOnValue());
+  const commands = new TextDecoder('latin1').decode(decodePDFRawStream(appearance).decode());
+  assert.doesNotMatch(commands, /\/ZaDb/);
+  assert.match(commands, /\bS\b/);
 });
 test('rejects unsupported glyphs instead of silently corrupting saved text', async () => {
   await assert.rejects(() => writePdf(original, fields, { ...values, 'Full name': '😀' }, [], { fontBytes }), /cannot display/);

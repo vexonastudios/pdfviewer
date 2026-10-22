@@ -1,4 +1,4 @@
-import { PDFDocument, PDFTextField, PDFCheckBox, PDFDropdown, PDFOptionList, PDFRadioGroup, PDFSignature, PDFButton, PDFName, StandardFonts, defaultCheckBoxAppearanceProvider, rgb, degrees } from 'pdf-lib';
+import { PDFDocument, PDFTextField, PDFCheckBox, PDFDropdown, PDFOptionList, PDFRadioGroup, PDFSignature, PDFButton, PDFName, PDFDict, PDFRawStream, decodePDFRawStream, StandardFonts, defaultCheckBoxAppearanceProvider, rgb, degrees } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { fittingTextFieldAppearance } from './field-appearance.mjs';
 
@@ -35,6 +35,19 @@ function setField(field, value) {
   else throw new Error(`The field “${field.getName()}” cannot be filled.`);
 }
 
+function usesFontBasedCheck(doc, widget) {
+  if (widget.getAppearanceCharacteristics()?.getCaptions()?.normal === '4') return true;
+  const normal = widget.getAppearances()?.normal;
+  const on = widget.getOnValue();
+  if (!(normal instanceof PDFDict) || !on) return false;
+  const stream = doc.context.lookup(normal.get(on));
+  if (!(stream instanceof PDFRawStream)) return false;
+  try {
+    const commands = new TextDecoder('latin1').decode(decodePDFRawStream(stream).decode());
+    return /\/ZaDb\b/.test(commands) && /\(4\)\s*Tj\b/.test(commands);
+  } catch { return false; }
+}
+
 export async function writePdf(original, fields, values, additions = [], { flatten = false, fontBytes } = {}) {
   const doc = await PDFDocument.load(original);
   const form = doc.getForm();
@@ -62,12 +75,12 @@ export async function writePdf(original, fields, values, additions = [], { flatt
     expected.push([descriptor.name, value]);
   }
   form.updateFieldAppearances(font);
-  // Some forms use ZapfDingbats character "4" for square choices. Its tiny
-  // font-based check can disappear in rendered and printed PDFs. Replace it
-  // with a vector check in the widget appearance, keeping the field editable.
+  // Some forms use ZapfDingbats character "4" for square choices, even when
+  // the appearance caption is absent. Its check can disappear when rendered.
+  // Replace only those font-based appearances with a vector check.
   for (const field of form.getFields()) {
     if ((field instanceof PDFRadioGroup || field instanceof PDFCheckBox) && field.acroField.getWidgets().length &&
-        field.acroField.getWidgets().every(widget => widget.getAppearanceCharacteristics()?.getCaptions()?.normal === '4')) {
+        field.acroField.getWidgets().every(widget => usesFontBasedCheck(doc, widget))) {
       for (const widget of field.acroField.getWidgets()) {
         if (!(widget.getBorderStyle()?.getWidth() > 0)) widget.getOrCreateBorderStyle().setWidth(0.8);
       }
