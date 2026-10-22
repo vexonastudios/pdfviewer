@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-async function desktopHarness() {
+async function desktopHarness(argv = ['electron', root]) {
   const handlers = new Map(), listeners = new Map(), protocols = new Map();
   let mainWindow;
   const dialog = { showOpenDialog: async () => ({ canceled: true }), showSaveDialog: async () => ({ canceled: true }), showMessageBoxSync: () => 0 };
@@ -30,7 +30,7 @@ async function desktopHarness() {
     protocol: { registerSchemesAsPrivileged() {}, handle: (name, handler) => protocols.set(name, handler) },
     net: { fetch: async url => new Response(url) },
   };
-  const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv: ['electron', root], env: {} }, Uint8Array, Response, URL });
+  const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Uint8Array, Response, URL });
   vm.runInContext(await readFile(path.join(root, 'electron/main.cjs'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
   return { handlers, listeners, protocols, dialog, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
@@ -69,6 +69,23 @@ test('desktop open backend reads the selected PDF and cancelled dialogs do not c
   h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [input] });
   const result = await open(h.event);
   assert.equal(result.name, 'desktop-open-test.pdf'); assert.equal(new TextDecoder().decode(result.bytes), '%PDF-test');
+});
+
+test('desktop review queue preserves argument order and opens each file on demand', async () => {
+  await mkdir(path.join(root, 'tmp/qa'), { recursive: true });
+  const first = path.join(root, 'tmp/qa/review-first.paperdesk.json');
+  const second = path.join(root, 'tmp/qa/review-second.pdf');
+  await writeFile(first, '{"format":"paperdesk-workspace-v1"}');
+  await writeFile(second, '%PDF-second');
+  const h = await desktopHarness(['electron', root, first, second]);
+  const initial = await h.handlers.get('pdf:initial')(h.event);
+  assert.equal(initial.file.name, 'review-first.paperdesk.json');
+  assert.deepEqual(Array.from(initial.review.items, item => item.name), ['review-first.paperdesk.json', 'review-second.pdf']);
+  const next = await h.handlers.get('pdf:review-file')(h.event, initial.review.id, 1);
+  assert.equal(next.name, 'review-second.pdf');
+  assert.equal(new TextDecoder().decode(next.bytes), '%PDF-second');
+  await assert.rejects(() => h.handlers.get('pdf:review-file')(h.event, initial.review.id, 2), /review item is unavailable/);
+  await assert.rejects(() => h.handlers.get('pdf:review-file')({ sender: {} }, initial.review.id, 0), /Unknown caller/);
 });
 
 test('closing with unsaved edits can be cancelled', async () => {

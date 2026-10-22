@@ -1,13 +1,16 @@
 const { app, BrowserWindow, dialog, ipcMain, shell, Menu, protocol, net } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'paperdesk', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }]);
 
 let window;
 let dirty = false;
-let pendingPath = process.argv.slice(1).find(arg => arg.toLowerCase().endsWith('.pdf'));
+const fileArguments = args => args.slice(1).filter(arg => /(?:\.pdf|\.paperdesk\.json)$/i.test(arg));
+let pendingPaths = fileArguments(process.argv);
+const reviewSessions = new Map();
 const lock = app.requestSingleInstanceLock();
 if (!lock) app.quit();
 
@@ -23,12 +26,20 @@ async function readPDF(filePath) {
   return { name: path.basename(filePath), bytes: new Uint8Array(bytes) };
 }
 
+async function prepareOpen(paths) {
+  const file = await readPDF(paths[0]);
+  if (paths.length === 1) return { file, review: null };
+  const id = randomUUID();
+  reviewSessions.set(id, paths);
+  return { file, review: { id, items: paths.map(filePath => ({ name: path.basename(filePath) })) } };
+}
+
 app.on('second-instance', (_, args) => {
-  const filePath = args.find(arg => arg.toLowerCase().endsWith('.pdf'));
+  const paths = fileArguments(args);
   if (window) {
     if (window.isMinimized()) window.restore();
     window.focus();
-    if (filePath) readPDF(filePath).then(file => window.webContents.send('pdf:open-file', file)).catch(error => dialog.showErrorBox('Cannot open PDF', error.message));
+    if (paths.length) prepareOpen(paths).then(open => window.webContents.send(paths.length > 1 ? 'pdf:open-review' : 'pdf:open-file', paths.length > 1 ? open : open.file)).catch(error => dialog.showErrorBox('Cannot open PDF', error.message));
   }
 });
 
@@ -66,10 +77,16 @@ ipcMain.handle('pdf:open', async event => {
 });
 ipcMain.handle('pdf:initial', async event => {
   validSender(event);
-  if (!pendingPath) return null;
-  const filePath = pendingPath;
-  pendingPath = undefined;
-  return readPDF(filePath);
+  if (!pendingPaths.length) return null;
+  const paths = pendingPaths;
+  pendingPaths = [];
+  return prepareOpen(paths);
+});
+ipcMain.handle('pdf:review-file', async (event, id, index) => {
+  validSender(event);
+  const paths = reviewSessions.get(id);
+  if (!paths || !Number.isInteger(index) || index < 0 || index >= paths.length) throw new Error('This review item is unavailable. Reopen the review queue.');
+  return readPDF(paths[index]);
 });
 ipcMain.handle('pdf:save', async (event, { bytes, name, kind }) => {
   validSender(event);

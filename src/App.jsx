@@ -12,6 +12,13 @@ GlobalWorkerOptions.workerSrc = workerUrl;
 const emptyState = { values: {}, additions: [] };
 const fingerprint = state => JSON.stringify(state);
 const fileStem = name => name.replace(/\.pdf$/i, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+function reviewLabel(name) {
+  const stem = name.replace(/\.paperdesk\.json$/i, '').replace(/\.pdf$/i, '');
+  const match = /^K-904-(2250|2253a|2253b) - (.+)$/i.exec(stem);
+  if (!match) return stem;
+  const form = { '2250': 'Request', '2253a': 'Needs worksheet', '2253b': 'Resources worksheet' }[match[1].toLowerCase()];
+  return `${match[2]} · ${form} (${match[1]})`;
+}
 let fontPromise;
 async function getFont() {
   fontPromise ??= fetch(new URL('./fonts/NotoSans-Regular.ttf', document.baseURI)).then(response => { if (!response.ok) throw new Error('The local font could not be loaded. Restart the app.'); return response.arrayBuffer(); }).then(buffer => new Uint8Array(buffer));
@@ -87,6 +94,7 @@ function BulkPanel({ fields, onApply, onBatch, onCopy, busy, duplicateNames, act
 
 export default function App() {
   const [documentState, setDocument] = useState(null);
+  const [review, setReview] = useState(null);
   const [history, setHistory] = useState({ past: [], present: emptyState, future: [] });
   const [saved, setSaved] = useState(fingerprint(emptyState));
   const [page, setPage] = useState(1), [zoom, setZoom] = useState('fit'), [rotation, setRotation] = useState(0);
@@ -130,7 +138,7 @@ export default function App() {
     return { values: nextValues, additions: current.additions.map(item => Object.hasOwn(values, `Text: ${item.label}`) ? { ...item, text: String(values[`Text: ${item.label}`]) } : item) };
   }
   async function loadFile(file) {
-    if (!file) return;
+    if (!file) return false;
     setBusy('Opening your PDF…'); setError('');
     let candidate;
     try {
@@ -170,21 +178,33 @@ export default function App() {
       setPage(1); setZoom('fit'); setRotation(0); setSelected(null); setTool('select'); setSearch(''); setSearchResults([]); searchRun.current++; setSearching(false); setFieldSearch(''); setTab('fields');
       previous?.pdf.loadingTask.destroy();
       notify(`${name} is ready`);
+      return true;
     } catch (error) {
       await candidate?.destroy();
       if (!/cancel|destroy/i.test(error.message)) setError(error.message || 'This PDF could not be opened.');
+      return false;
     } finally { setBusy(''); loadTask.current = null; setPasswordRequest(null); }
   }
   async function open() {
-    if (window.paperdesk) { try { const file = await window.paperdesk.open(); if (file) guard(() => loadFile(file)); } catch (error) { setError(error.message); } }
+    if (window.paperdesk) { try { const file = await window.paperdesk.open(); if (file) guard(async () => { if (await loadFile(file)) setReview(null); }); } catch (error) { setError(error.message); } }
     else inputRef.current.click();
   }
-  async function browserFile(file) { if (!file) return; try { const bytes = new Uint8Array(await file.arrayBuffer()); guard(() => loadFile({ name: file.name, bytes })); } catch (error) { setError(error.message); } }
+  async function browserFile(file) { if (!file) return; try { const bytes = new Uint8Array(await file.arrayBuffer()); guard(async () => { if (await loadFile({ name: file.name, bytes })) setReview(null); }); } catch (error) { setError(error.message); } }
+  function showReviewItem(index) {
+    if (!review || index === review.index || index < 0 || index >= review.items.length || busy) return;
+    guard(async () => {
+      try {
+        const file = await window.paperdesk.reviewFile(review.id, index);
+        if (await loadFile(file)) setReview(current => current?.id === review.id ? { ...current, index } : current);
+      } catch (error) { setError(error.message); }
+    });
+  }
   useEffect(() => {
-    window.paperdesk?.initialFile().then(file => file && loadFile(file)).catch(error => setError(error.message));
+    window.paperdesk?.initialFile().then(async open => { if (open && await loadFile(open.file)) setReview(open.review ? { ...open.review, index: 0 } : null); }).catch(error => setError(error.message));
     return () => { documentRef.current?.pdf.loadingTask.destroy(); };
   }, []);
-  useEffect(() => window.paperdesk?.onOpen(file => guard(() => loadFile(file))), [dirty]);
+  useEffect(() => window.paperdesk?.onOpen(file => guard(async () => { if (await loadFile(file)) setReview(null); })), [dirty]);
+  useEffect(() => window.paperdesk?.onReview(open => guard(async () => { if (await loadFile(open.file)) setReview({ ...open.review, index: 0 }); })), [dirty]);
   useEffect(() => {
     const keyboard = event => {
       if (modal || passwordRequest || busy) return;
@@ -276,10 +296,11 @@ export default function App() {
   const fieldList = fields.filter(field => `${field.label} ${field.name}`.toLowerCase().includes(fieldSearch.toLowerCase()));
   return <div className={`app ${documentState ? 'has-document' : ''}`} onDragEnter={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); dragCount.current++; setDragging(true); } }} onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDragLeave={event => { event.preventDefault(); dragCount.current--; if (dragCount.current <= 0) setDragging(false); }} onDrop={event => { event.preventDefault(); dragCount.current = 0; setDragging(false); if (!busy) browserFile(event.dataTransfer.files[0]); }}>
     <input ref={inputRef} className="visually-hidden" type="file" accept=".pdf,.paperdesk.json" aria-label="Choose PDF file" onChange={event => { browserFile(event.target.files?.[0]); event.target.value = ''; }} />
-    <header className="app-header"><button className="brand" title="Paperdesk home" onClick={() => guard(() => { const previous = documentRef.current; documentRef.current = null; setDocument(null); setHistory({ past: [], present: emptyState, future: [] }); setSaved(fingerprint(emptyState)); previous?.pdf.loadingTask.destroy(); })}><span className="brand-mark"><FileText size={23} strokeWidth={1.7} /></span><span>paperdesk<span className="brand-pdf">PDF</span></span></button>
+    <header className="app-header"><button className="brand" title="Paperdesk home" onClick={() => guard(() => { const previous = documentRef.current; documentRef.current = null; setDocument(null); setReview(null); setHistory({ past: [], present: emptyState, future: [] }); setSaved(fingerprint(emptyState)); previous?.pdf.loadingTask.destroy(); })}><span className="brand-mark"><FileText size={23} strokeWidth={1.7} /></span><span>paperdesk<span className="brand-pdf">PDF</span></span></button>
       <div className="header-center">{documentState ? <><FileText size={15} /><span title={documentState.name}>{documentState.name}</span><span className={`save-status ${dirty ? 'unsaved' : ''}`}>{dirty ? 'Unsaved changes' : 'All set'}</span></> : <span className="header-tagline">A little less paperwork.</span>}</div>
       <div className="header-actions"><button className="icon-button help-button" aria-label="Help" onClick={() => setModal('help')}><HelpCircle size={19} /></button><button className="secondary" onClick={open} disabled={Boolean(busy)}><FolderOpen size={16} /> Open PDF</button>{documentState && <button className="primary" onClick={() => setModal('save')} disabled={Boolean(busy)}><Download size={16} /> Save a copy</button>}</div>
     </header>
+    {review && documentState && <nav className="review-queue" aria-label="Document review queue"><span className="review-queue-title">REVIEW QUEUE</span><strong>{review.index + 1} of {review.items.length}</strong><select aria-label="Jump to form" value={review.index} onChange={event => showReviewItem(Number(event.target.value))} disabled={Boolean(busy)}>{review.items.map((item, index) => <option key={index} value={index}>{index + 1}. {reviewLabel(item.name)}</option>)}</select><button className="secondary" onClick={() => showReviewItem(review.index - 1)} disabled={review.index === 0 || Boolean(busy)}><ChevronLeft size={16} /> Previous form</button><button className="primary" onClick={() => showReviewItem(review.index + 1)} disabled={review.index === review.items.length - 1 || Boolean(busy)}>Next form <ChevronRight size={16} /></button></nav>}
     {!documentState ? <main className="welcome"><div className="welcome-main"><span className="welcome-kicker"><span /> YOUR EVERYDAY PDF WORKSPACE</span><h1>Paperwork,<br /><em>without the work.</em></h1><p className="welcome-description">Open it. Fill it. Make it yours.<br />A simpler home for your PDFs, right on your computer.</p><div className="drop-card" onClick={open} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } }} role="button" tabIndex={0} aria-label="Open a PDF"><div className="drop-icon"><FileText size={30} strokeWidth={1.4} /><span><Plus size={13} /></span></div><div><h2>Drop your PDF here</h2><p>or click to choose a file</p></div><span className="drop-arrow"><ArrowUpRight size={22} /></span></div><div className="welcome-under"><span><LockKeyhole size={13} /> Files stay on your computer</span><button className="text-button" onClick={() => guard(async () => { try { setBusy('Creating a practice form…'); await loadFile({ name: 'Welcome to Paperdesk.pdf', bytes: await createSample() }); } catch (error) { setBusy(''); setError(error.message); } })}>Try a practice form <ArrowRight size={14} /></button></div></div>
       <div className="welcome-art" aria-hidden="true"><div className="paper-back" /><div className="illustration-paper"><div className="mini-brand"><span /> PAPERDESK</div><div className="paper-title">Goodbye, busywork.</div><div className="paper-subtitle">Hello, done.</div><div className="illustration-rule" /><div className="mock-label">FULL NAME</div><div className="mock-field">Jamie Parker<span className="caret" /></div><div className="mock-two"><div><div className="mock-label">YOUR EMAIL</div><div className="mock-line" /></div><div><div className="mock-label">DATE</div><div className="mock-line short" /></div></div><div className="mock-checkbox"><span><Check size={13} /></span> A much better way to PDF.</div><div className="mock-signature">All taken care of.</div><div className="paper-bottom">ONE LESS THING ON YOUR LIST <span>01</span></div></div><div className="floating-chip"><CheckCircle2 size={20} /><span>Filled, saved, sorted.</span></div><div className="annotation-chip"><Sparkles size={14} /> A helping hand, built in</div></div>
       <div className="welcome-features"><div><span className="feature-icon"><FileText size={20} /></span><section><h3>Read comfortably</h3><p>A clear view. Every page, every detail.</p></section></div><div><span className="feature-icon"><Type size={20} /></span><section><h3>Fill any layout</h3><p>Use form fields or add your own text.</p></section></div><div><span className="feature-icon"><Layers size={20} /></span><section><h3>Skip the repetitive bits</h3><p>Paste your details and fill in bulk.</p></section></div></div>

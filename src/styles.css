@@ -23,3 +23,6 @@
 .highlight-fields .pdf-field.field-multiline textarea{background:transparent;box-shadow:none}
 .pdf-field.field-multiline:focus-within{outline:2px solid #83a996;background:#fff}
 .pdf-field.field-multiline textarea:focus{outline:none}
+.review-queue{min-height:56px;padding:8px 33px;display:flex;align-items:center;gap:12px;background:#f2f6ef;border-bottom:1px solid #dce6d8;z-index:4}.review-queue-title{font-size:10px;font-weight:700;letter-spacing:1.2px;color:#678363;white-space:nowrap}.review-queue strong{font-size:12px;color:#385848;white-space:nowrap}.review-queue select{flex:1;max-width:450px;min-width:150px;height:36px}.review-queue .secondary,.review-queue .primary{min-height:36px;padding:8px 12px}
+@media(max-width:1150px){.review-queue{padding:8px 22px;gap:8px}.review-queue-title{display:none}}
+@media(max-width:850px){.review-queue{padding:8px 16px}.review-queue button{font-size:0;gap:0}.review-queue button svg{width:18px;height:18px}}
