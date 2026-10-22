@@ -35,6 +35,15 @@ test('flattening removes form widgets, and placed text is exported', async () =>
   }
   await writeFile(new URL('../tmp/qa/flattened.pdf', import.meta.url), output);
 });
+test('a placed ink signature survives export while form fields stay editable', async () => {
+  const pixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg==';
+  const additions = [{ kind: 'signature', dataUrl: pixel, x: 48, y: 115, width: 160, height: 32, page: 1, rotation: 0 }];
+  const output = await writePdf(original, fields, { ...values, 'Full name': 'Jamie Parker' }, additions, { fontBytes });
+  const reopened = await PDFDocument.load(output);
+  assert.equal(reopened.getForm().getTextField('Full name').getText(), 'Jamie Parker');
+  assert.ok(reopened.getPage(0).node.Resources().lookup(PDFName.of('XObject'), PDFDict).keys().length > 0);
+  await writeFile(new URL('../tmp/qa/signature-placement.pdf', import.meta.url), output);
+});
 test('different records are independent, and clearing fields survives reopening', async () => {
   const a = await writePdf(original, fields, { ...values, 'Full name': 'Record A', 'Contact method': '' }, [], { fontBytes });
   const b = await writePdf(original, fields, { ...values, 'Full name': 'Record B' }, [], { fontBytes });

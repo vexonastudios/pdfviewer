@@ -74,6 +74,11 @@ export async function writePdf(original, fields, values, additions = [], { flatt
         x: addition.x + Math.sin(radians) * down, y: addition.y - Math.cos(radians) * down,
         size: addition.size, font, color, rotate: degrees(angle), lineHeight: addition.size * 1.25,
       });
+    } else if (addition.kind === 'signature') {
+      if (!/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(addition.dataUrl || '') || addition.dataUrl.length > 2_000_000 || !(addition.width > 0 && addition.width <= 500) || !(addition.height > 0 && addition.height <= 500)) throw new Error('A placed signature is invalid.');
+      const image = await doc.embedPng(addition.dataUrl);
+      const angle = (addition.rotation || 0) * Math.PI / 180;
+      page.drawImage(image, { x: addition.x + Math.sin(angle) * addition.height, y: addition.y - Math.cos(angle) * addition.height, width: addition.width, height: addition.height, rotate: degrees(addition.rotation || 0) });
     } else if (addition.kind === 'check') {
       const angle = (addition.rotation || 0) * Math.PI / 180;
       const point = (x, y) => ({ x: addition.x + x * Math.cos(angle) + y * Math.sin(angle), y: addition.y + x * Math.sin(angle) - y * Math.cos(angle) });

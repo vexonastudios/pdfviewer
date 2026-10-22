@@ -1,19 +1,22 @@
 # Paperdesk PDF
 
-A local Windows Electron app for viewing PDFs, filling standard forms, placing text and checkmarks, and making filled copies in bulk. Documents and pasted data are processed on your computer. No account, API key, or server is required.
+A local Windows Electron app for viewing PDFs, filling standard forms, placing text, checkmarks, and ink-image signatures, and making filled copies in bulk. Documents and pasted data are processed on your computer. No account, API key, or server is required.
 
 ## Run the app
 
-For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. The current build is `Paperdesk-PDF-1.0.1-checkbox-fix.exe`; it does not require installation. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
+For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
 
-Version 1.0.1 centers short answers vertically in multiline PDF fields, including dates in tall boxes. The correction applies in the viewer, editable PDF copies, flattened copies, and bulk exports. Square checkbox marks are also drawn as vectors so selected choices stay visible in exported PDFs. Longer entries wrap and scroll in the editor. Existing workspaces remain compatible. Save your work and close the previous version before opening the updated app.
+Version 1.0.2 adds locally saved signatures and photo import. Short answers remain vertically centered in multiline PDF fields, and square checkbox marks remain visible in exported PDFs. Existing workspaces remain compatible.
 
 ## Everyday use
 
 1. Click **Open PDF**, or drag a PDF onto the window. **Try a practice form** provides a sample.
 2. Fill existing fields directly on the page or in the Fields panel. Use **Add text** or **Checkmark** on flat/scanned forms. Select an added item to edit it, change its size, or drag it into position.
-3. Choose **Save a copy**. Editable PDF copies preserve existing form fields. Flattened copies make field appearances permanent. Added text/checkmarks become page content in either PDF export.
-4. Choose **Save editable workspace** to retain the original PDF, field values, and movable text boxes in a `.paperdesk.json` file. Reopen that file using Open PDF. Workspace files contain your document and entered information; store them like the original PDF.
+3. To sign, click **Sign**. Draw directly, or choose **Import a photo** to select a picture of a signature on white paper. Review the transparent preview before saving it locally. Choose **Place**, click the intended signature line, and move or resize the image. Each person should review the form and place their own signature.
+4. Choose **Save a copy**. Editable PDF copies preserve existing form fields. Flattened copies make field appearances permanent. Added text, checkmarks, and signatures become page content in either PDF export.
+5. Choose **Save editable workspace** to retain the original PDF, field values, and movable additions in a `.paperdesk.json` file. Reopen that file using Open PDF. Workspace files contain your document and entered information, including any placed signature images; store them like the original PDF.
+
+Saved signatures are kept in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. Signature images are visual marks, not certificate-backed digital signatures.
 
 The app does not save silently. It warns before replacing a document with unsaved edits or closing with changes. Saving opens a Save As dialog; your original remains untouched unless you explicitly select it for replacement.
 
@@ -39,7 +42,7 @@ For a flat form, place text boxes first, give them unique field names, and save 
 | Find document text | Ctrl+F |
 | Undo / redo | Ctrl+Z / Ctrl+Y (outside text inputs) |
 | Previous / next page | Left / right arrow (outside inputs) |
-| Remove selected text/checkmark | Delete |
+| Remove selected addition | Delete |
 | Cancel placement | Escape |
 
 Rotation changes the viewing orientation, not the original page rotation. Text placed in a rotated view retains its intended orientation when exported.
@@ -50,7 +53,7 @@ Rotation changes the viewing orientation, not the original page rotation. Text p
 - Text can be placed over scanned pages, but OCR and automatic detection of blank lines are not included.
 - No existing-page text editing, page reordering, redaction, certificate signing, or built-in printing in this first version.
 - The bundled Noto Sans font supports many alphabets, but not all scripts or emoji. Export reports unsupported characters instead of silently substituting them. Review long values for fit.
-- Added text and checkmarks are permanent in exported PDFs. Retain a workspace for future editing.
+- Added text, checkmarks, and signatures are permanent in exported PDFs. Retain a workspace for future editing.
 - Individual files are limited to 300 MB. Complex PDFs may take longer to render.
 
 ## Development
@@ -67,6 +70,6 @@ npm run package
 
 For browser development use `npm run dev -- --port 5184`. The browser preview uses downloads instead of native Windows dialogs. All fonts, PDF.js workers, CMaps, and rendering assets are bundled in the built app; no CDN is used.
 
-`npm test` covers bulk parsing/mapping, PDF value round trips, appearances, flattening, independent records, Unicode validation, native file-operation handlers, local protocol boundaries, and unsaved-change handling. Test artifacts are written to `tmp/qa`. Additional manual verification opened and filled the practice form in the browser preview, placed named text, saved a PDF and two-record ZIP, and independently checked exported field data and text with pypdf and rendered output with Poppler. Native Windows dialog interaction was not exercised because computer-use approval timed out; its IPC/file-operation backend is tested with dialog mocks.
+`npm test` covers bulk parsing/mapping, PDF value round trips, appearances, flattening, independent records, Unicode validation, signature image export and photo cleanup, native file-operation handlers, local protocol boundaries, and unsaved-change handling. Test artifacts are written to `tmp/qa`.
 
 PDF rendering uses [Mozilla PDF.js](https://mozilla.github.io/pdf.js/). PDF writing uses [pdf-lib](https://pdf-lib.js.org/). The local desktop protocol follows the [Electron protocol API](https://www.electronjs.org/docs/latest/api/protocol/). Noto Sans is licensed under the SIL Open Font License; its license is included in `public/fonts`.

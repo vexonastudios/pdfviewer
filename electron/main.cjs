@@ -8,6 +8,27 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'paperdesk', privileges: { stand
 
 let window;
 let dirty = false;
+const signaturePath = () => path.join(app.getPath('appData'), 'Paperdesk PDF', 'signatures.json');
+function validSignature(record) {
+  if (!record || typeof record.signer !== 'string' || !record.signer.trim() || record.signer.length > 80 || /[\x00-\x1f]/.test(record.signer) || typeof record.dataUrl !== 'string' ||
+      !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(record.dataUrl) || record.dataUrl.length > 2_000_000 ||
+      !Number.isInteger(record.width) || !Number.isInteger(record.height) ||
+      record.width < 1 || record.height < 1 || record.width > 3000 || record.height > 3000) throw new Error('Invalid signature image.');
+  const png = Buffer.from(record.dataUrl.slice('data:image/png;base64,'.length), 'base64');
+  if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('A PNG signature image is required.');
+  return { signer: record.signer, dataUrl: record.dataUrl, width: record.width, height: record.height };
+}
+async function readSignatures() {
+  try {
+    const records = JSON.parse(await fs.readFile(signaturePath(), 'utf8'));
+    return Array.isArray(records) ? records.map(validSignature).slice(0, 20) : [];
+  } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+}
+async function writeSignatures(records) {
+  const target = signaturePath();
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, JSON.stringify(records), { mode: 0o600 });
+}
 const fileArguments = args => args.slice(1).filter(arg => /(?:\.pdf|\.paperdesk\.json)$/i.test(arg));
 let pendingPaths = fileArguments(process.argv);
 const reviewSessions = new Map();
@@ -97,6 +118,23 @@ ipcMain.handle('pdf:save', async (event, { bytes, name, kind }) => {
   if (result.canceled) return null;
   await fs.writeFile(result.filePath, bytes);
   return { name: path.basename(result.filePath), path: result.filePath };
+});
+ipcMain.handle('pdf:signatures-list', async event => { validSender(event); return readSignatures(); });
+ipcMain.handle('pdf:signatures-save', async (event, record) => {
+  validSender(event);
+  const safe = validSignature(record);
+  const records = (await readSignatures()).filter(item => item.signer !== safe.signer);
+  if (records.length >= 20) throw new Error('Remove a saved signature before adding another.');
+  records.push(safe);
+  await writeSignatures(records);
+  return records;
+});
+ipcMain.handle('pdf:signatures-remove', async (event, signer) => {
+  validSender(event);
+  if (typeof signer !== 'string' || !signer.trim() || signer.length > 80) throw new Error('Unknown signer.');
+  const records = (await readSignatures()).filter(item => item.signer !== signer);
+  await writeSignatures(records);
+  return records;
 });
 ipcMain.on('pdf:dirty', (event, value) => { validSender(event); dirty = Boolean(value); });
 ipcMain.handle('pdf:show-output', async (event, filePath) => {

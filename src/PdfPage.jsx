@@ -99,7 +99,7 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
   }
   function clickPage(event) {
     if (!ready || readOnly || event.target.closest('input, textarea, select, button, .addition')) return;
-    if (tool === 'text' || tool === 'check') {
+    if (tool === 'text' || tool === 'check' || tool === 'signature') {
       const [x, y] = coordinates(event);
       onPlace({ x, y, page: number, rotation: ready.viewport.rotation });
     } else onSelect(null);
@@ -147,7 +147,7 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
       {ready && additions.filter(item => item.page === number).map(item => {
         const [left, top] = ready.viewport.convertToViewportPoint(item.x, item.y);
         return <div key={item.id} role="button" tabIndex={0} aria-label={`Edit ${item.label || item.kind}`} className={`addition ${selected === item.id ? 'selected' : ''}`} onKeyDown={event => { if (event.key === 'Enter') onSelect(item.id); }} onPointerDown={event => moveStart(event, item)} onPointerMove={move} onPointerUp={moveEnd} onPointerCancel={moveEnd} style={{ left, top, fontSize: item.size * ready.scale, transform: `rotate(${ready.viewport.rotation - (item.rotation || 0)}deg)` }}>
-          {item.kind === 'check' ? <Check size={item.size * ready.scale} strokeWidth={2.8} /> : <span>{item.text || 'Text'}</span>}
+          {item.kind === 'signature' ? <img className="placed-signature" src={item.dataUrl} alt={item.label} draggable={false} style={{ width: item.width * ready.scale, height: item.height * ready.scale }} /> : item.kind === 'check' ? <Check size={item.size * ready.scale} strokeWidth={2.8} /> : <span>{item.text || 'Text'}</span>}
         </div>;
       })}
       {rendering && <div className="rendering-indicator">Rendering page…</div>}
