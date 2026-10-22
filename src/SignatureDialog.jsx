@@ -22,7 +22,7 @@ function croppedSignature(canvas) {
   return { dataUrl: output.toDataURL('image/png'), width: output.width, height: output.height };
 }
 
-export default function SignatureDialog({ signatures, onSave, onRemove, onPlace, onClose }) {
+export default function SignatureDialog({ signatures, target, onSave, onRemove, onPlace, onClose }) {
   const canvasRef = useRef(null), drawing = useRef(false), photoRun = useRef(0);
   const [signer, setSigner] = useState('');
   const [mode, setMode] = useState('draw'), [photo, setPhoto] = useState(null), [cleanedPhoto, setCleanedPhoto] = useState(null), [threshold, setThreshold] = useState(65);
@@ -78,8 +78,8 @@ export default function SignatureDialog({ signatures, onSave, onRemove, onPlace,
     finally { setBusy(false); }
   }
   return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="modal wide signature-dialog" role="dialog" aria-modal="true" aria-label="Your signatures"><div className="modal-heading"><h2>Your signatures</h2><button className="icon-button" aria-label="Close dialog" onClick={onClose}><X size={19} /></button></div>
-    <p className="muted">Draw a signature or import a photo of one signed on paper. Choose Place, then click its line on the PDF. You can move and resize it before saving.</p>
-    <div className="signature-library">{signatures.length ? signatures.map(saved => <div className="signature-card" key={saved.signer}><strong>{saved.signer}</strong><div className="signature-preview"><img src={saved.dataUrl} alt={`${saved.signer}'s saved signature`} /></div><button className="primary" onClick={() => onPlace(saved)}><PenLine size={15} /> Place</button><button className="icon-button" title={`Remove ${saved.signer}'s saved signature`} aria-label={`Remove ${saved.signer}'s saved signature`} onClick={() => onRemove(saved.signer)}><Trash2 size={16} /></button></div>) : <div className="notice">No signatures saved yet. Each person can draw their own below.</div>}</div>
+    <p className="muted">{target ? 'Choose the person signing this box. Paperdesk will place the saved signature and fill the nearby Date Signed field with today’s date. Review both before saving.' : 'Choose Place, then click the signature line on the PDF. You can move and resize it before saving.'}</p>
+    <div className="signature-library">{signatures.length ? signatures.map(saved => <div className="signature-card" key={saved.signer}><strong>{saved.signer}</strong><div className="signature-preview"><img src={saved.dataUrl} alt={`${saved.signer}'s saved signature`} /></div><button className="primary" onClick={() => onPlace(saved)}><PenLine size={15} /> {target ? 'Sign this box' : 'Place'}</button><button className="icon-button" title={`Remove ${saved.signer}'s saved signature`} aria-label={`Remove ${saved.signer}'s saved signature`} onClick={() => onRemove(saved.signer)}><Trash2 size={16} /></button></div>) : <div className="notice">No signatures saved yet. Each person can draw their own below.</div>}</div>
     <label className="input-label" htmlFor="signature-signer">Signer’s name <span>Use the same name to replace a saved signature</span></label><input id="signature-signer" maxLength={80} placeholder="Full name" value={signer} onChange={event => setSigner(event.target.value)} />
     <div className="signature-mode"><button className={mode === 'draw' ? 'active' : ''} onClick={() => setMode('draw')}>Draw here</button><button className={mode === 'photo' ? 'active' : ''} onClick={() => setMode('photo')}>Import a photo</button></div>
     <canvas ref={canvasRef} hidden={mode !== 'draw'} className="signature-canvas" aria-label="Draw the signature" onPointerDown={start} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} />

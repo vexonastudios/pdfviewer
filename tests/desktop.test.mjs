@@ -60,6 +60,24 @@ test('desktop save backend handles cancellation, selected file paths, bytes and 
   await assert.rejects(() => save(h.event, { bytes: 'invalid', name: 'test.pdf' }), /Invalid output/);
 });
 
+test('Save updates an opened workspace and final export opens in a separate Finals folder', async () => {
+  await mkdir(path.join(root, 'tmp/qa'), { recursive: true });
+  const draft = path.join(root, 'tmp/qa/save-draft.paperdesk.json');
+  await writeFile(draft, 'before');
+  const h = await desktopHarness(['electron', root, draft]);
+  await h.handlers.get('pdf:initial')(h.event);
+  const save = h.handlers.get('pdf:save');
+  const updated = new TextEncoder().encode('after');
+  const saved = await save(h.event, { bytes: updated, name: 'save-draft.paperdesk.json', kind: 'json', overwritePath: draft });
+  assert.equal(saved.path, draft);
+  assert.equal(await readFile(draft, 'utf8'), 'after');
+  await assert.rejects(() => save(h.event, { bytes: updated, name: 'other.paperdesk.json', kind: 'json', overwritePath: path.join(root, 'tmp/qa/other.paperdesk.json') }), /not open for saving/);
+  let requestedPath;
+  h.dialog.showSaveDialog = async (_, options) => { requestedPath = options.defaultPath; return { canceled: true }; };
+  await save(h.event, { bytes: updated, name: 'save-draft-final.pdf', kind: 'final-pdf', sourcePath: draft });
+  assert.equal(requestedPath, path.join(root, 'tmp/qa/Final PDFs/save-draft-final.pdf'));
+});
+
 test('desktop open backend reads the selected PDF and cancelled dialogs do not change files', async () => {
   const h = await desktopHarness(); const open = h.handlers.get('pdf:open');
   assert.equal(await open(h.event), null);

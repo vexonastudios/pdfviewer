@@ -6,19 +6,19 @@ A local Windows Electron app for viewing PDFs, filling standard forms, placing t
 
 For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
 
-Version 1.0.2 adds locally saved signatures and photo import. Short answers remain vertically centered in multiline PDF fields, and square checkbox marks remain visible in exported PDFs. Existing workspaces remain compatible.
+Version 1.0.2 includes locally saved signatures and photo import. Long single-line answers fit their fields, short answers remain vertically centered in multiline fields, and existing workspaces remain compatible.
 
 ## Everyday use
 
 1. Click **Open PDF**, or drag a PDF onto the window. **Try a practice form** provides a sample.
 2. Fill existing fields directly on the page or in the Fields panel. Use **Add text** or **Checkmark** on flat/scanned forms. Select an added item to edit it, change its size, or drag it into position.
-3. To sign, click **Sign**. Draw directly, or choose **Import a photo** to select a picture of a signature on white paper. Review the transparent preview before saving it locally. Choose **Place**, click the intended signature line, and move or resize the image. Each person should review the form and place their own signature.
-4. Choose **Save a copy**. Editable PDF copies preserve existing form fields. Flattened copies make field appearances permanent. Added text, checkmarks, and signatures become page content in either PDF export.
-5. Choose **Save editable workspace** to retain the original PDF, field values, and movable additions in a `.paperdesk.json` file. Reopen that file using Open PDF. Workspace files contain your document and entered information, including any placed signature images; store them like the original PDF.
+3. To sign a fillable signature box, click **Sign here** and choose the saved signer. Paperdesk places the signature and fills the adjacent **Date Signed** field with today's date. The **Today** button also fills a signing date on its own. To create a saved signature, click **Sign**, then draw it or choose **Import a photo**. Each person should review the form and place their own signature.
+4. Click **Save** (or Ctrl+S) while working. An opened `.paperdesk.json` workspace saves back to that same file; the first Save from a PDF asks where to create a workspace. This draft retains the original PDF, field values, and movable additions. Workspace files contain your document and entered information, including placed signature images; store them like the original PDF.
+5. When the form is final, click **Export final PDF**, then **Export flattened PDF**. The Save dialog starts in a **Final PDFs** folder beside the draft, with a `-final.pdf` filename. This makes one share-ready PDF per form. Flattening removes interactive form fields, but does not make a PDF tamper-proof against deliberate editing with PDF software.
 
 Saved signatures are kept in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. Signature images are visual marks, not certificate-backed digital signatures.
 
-The app does not save silently. It warns before replacing a document with unsaved edits or closing with changes. Saving opens a Save As dialog; your original remains untouched unless you explicitly select it for replacement.
+The app does not save silently. It warns before replacing a document with unsaved edits or closing with changes. **Save** updates an opened workspace; exporting creates a separate PDF and does not mark the draft as saved.
 
 ## Using this chat to help fill forms
 
@@ -38,7 +38,7 @@ For a flat form, place text boxes first, give them unique field names, and save 
 | Action | Shortcut |
 | --- | --- |
 | Open | Ctrl+O |
-| Save copy | Ctrl+S |
+| Save editable work | Ctrl+S |
 | Find document text | Ctrl+F |
 | Undo / redo | Ctrl+Z / Ctrl+Y (outside text inputs) |
 | Previous / next page | Left / right arrow (outside inputs) |

@@ -51,6 +51,24 @@ test('different records are independent, and clearing fields survives reopening'
   assert.deepEqual((await PDFDocument.load(a)).getForm().getDropdown('Contact method').getSelected(), []);
   assert.equal((await PDFDocument.load(b)).getForm().getTextField('Full name').getText(), 'Record B');
 });
+test('long single-line values remain complete and their saved appearance fits the field', async () => {
+  const doc = await PDFDocument.create(); const page = doc.addPage();
+  const email = doc.getForm().createTextField('Email Address');
+  email.addToPage(page, { x: 50, y: 700, width: 160, height: 28, fontSize: 10 });
+  const source = await doc.save();
+  const { fields: emailFields } = await inspectPdf(source);
+  const address = 'alexander.longname@examplemail.com';
+  const output = await writePdf(source, emailFields, { 'Email Address': address }, [], { fontBytes });
+  const reopened = await PDFDocument.load(output);
+  const saved = reopened.getForm().getTextField('Email Address');
+  assert.equal(saved.getText(), address);
+  const appearance = saved.acroField.getWidgets()[0].getDefaultAppearance() || saved.acroField.getDefaultAppearance();
+  const size = Number([...appearance.matchAll(/\/[\w.-]+\s+(\d*\.?\d+)\s+Tf/g)].at(-1)?.[1]);
+  assert.ok(size > 0 && size < 10, `expected a fitted appearance, got ${size} from ${JSON.stringify(appearance)}`);
+  const { fields: existingFields } = await inspectPdf(output);
+  const resaved = await PDFDocument.load(await writePdf(output, existingFields, { 'Email Address': address }, [], { fontBytes }));
+  assert.equal(resaved.getForm().getTextField('Email Address').getText(), address);
+});
 test('radio and multi-select fields preserve their typed values', async () => {
   const doc = await PDFDocument.create(); const page = doc.addPage();
   const radio = doc.getForm().createRadioGroup('Priority'); radio.addOptionToPage('Normal', page, { x: 50, y: 650 }); radio.addOptionToPage('Urgent', page, { x: 50, y: 600 });

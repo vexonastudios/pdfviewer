@@ -1,6 +1,6 @@
 import { PDFDocument, PDFTextField, PDFCheckBox, PDFDropdown, PDFOptionList, PDFRadioGroup, PDFSignature, PDFButton, PDFName, StandardFonts, defaultCheckBoxAppearanceProvider, rgb, degrees } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
-import { centeredTextFieldAppearance } from './field-appearance.mjs';
+import { fittingTextFieldAppearance } from './field-appearance.mjs';
 
 export const readableName = name => name.split('.').at(-1).replace(/\[\d+\]/g, '').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim() || name;
 
@@ -53,13 +53,12 @@ export async function writePdf(original, fields, values, additions = [], { flatt
     if (!Object.hasOwn(values, descriptor.name) || descriptor.readOnly) continue;
     const value = values[descriptor.name];
     const changed = JSON.stringify(value) !== JSON.stringify(descriptor.value);
-    // Existing values need the corrected appearance too, including reopened
-    // workspaces and unchanged fields carried into a bulk export.
-    if (!changed && !(descriptor.type === 'text' && descriptor.multiline)) continue;
+    // Existing text values may have clipped appearances in reopened workspaces.
+    if (!changed && descriptor.type !== 'text') continue;
     ensureText(Array.isArray(value) ? value.join('') : String(value));
     const field = form.getField(descriptor.name);
     if (changed) setField(field, value);
-    if (field instanceof PDFTextField && field.isMultiline()) field.updateAppearances(font, centeredTextFieldAppearance);
+    if (field instanceof PDFTextField) field.updateAppearances(font, fittingTextFieldAppearance);
     expected.push([descriptor.name, value]);
   }
   for (const addition of additions) {

@@ -2,6 +2,7 @@ node_modules/
 dist/
 release/
 tmp/
+.codex-remote-attachments/
 public/pdfjs/
 public/THIRD_PARTY_NOTICES.txt
 *.log

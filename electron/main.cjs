@@ -32,6 +32,7 @@ async function writeSignatures(records) {
 const fileArguments = args => args.slice(1).filter(arg => /(?:\.pdf|\.paperdesk\.json)$/i.test(arg));
 let pendingPaths = fileArguments(process.argv);
 const reviewSessions = new Map();
+const openedPaths = new Set();
 const lock = app.requestSingleInstanceLock();
 if (!lock) app.quit();
 
@@ -40,11 +41,13 @@ function validSender(event) {
 }
 
 async function readPDF(filePath) {
-  if (!['.pdf', '.json'].includes(path.extname(filePath).toLowerCase())) throw new Error('Choose a PDF or Paperdesk workspace.');
-  const stat = await fs.stat(filePath);
+  const resolved = path.resolve(filePath);
+  if (!['.pdf', '.json'].includes(path.extname(resolved).toLowerCase())) throw new Error('Choose a PDF or Paperdesk workspace.');
+  const stat = await fs.stat(resolved);
   if (stat.size > 300 * 1024 * 1024) throw new Error('This PDF is larger than the 300 MB limit.');
-  const bytes = await fs.readFile(filePath);
-  return { name: path.basename(filePath), bytes: new Uint8Array(bytes) };
+  const bytes = await fs.readFile(resolved);
+  openedPaths.add(resolved);
+  return { name: path.basename(resolved), path: resolved, bytes: new Uint8Array(bytes) };
 }
 
 async function prepareOpen(paths) {
@@ -109,14 +112,27 @@ ipcMain.handle('pdf:review-file', async (event, id, index) => {
   if (!paths || !Number.isInteger(index) || index < 0 || index >= paths.length) throw new Error('This review item is unavailable. Reopen the review queue.');
   return readPDF(paths[index]);
 });
-ipcMain.handle('pdf:save', async (event, { bytes, name, kind }) => {
+ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sourcePath }) => {
   validSender(event);
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > 500 * 1024 * 1024) throw new Error('Invalid output file or file larger than 500 MB.');
   const extension = kind === 'zip' ? 'zip' : kind === 'json' ? 'json' : 'pdf';
   const safeName = path.basename(String(name || 'document')).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
-  const result = await dialog.showSaveDialog(window, { title: 'Save a copy', defaultPath: safeName, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
+  if (overwritePath) {
+    const target = path.resolve(overwritePath);
+    if (kind !== 'json' || !/\.paperdesk\.json$/i.test(target) || !openedPaths.has(target)) throw new Error('This workspace is not open for saving. Use Save As instead.');
+    await fs.writeFile(target, bytes);
+    return { name: path.basename(target), path: target };
+  }
+  let defaultPath = safeName;
+  if (kind === 'final-pdf' && sourcePath && openedPaths.has(path.resolve(sourcePath))) {
+    const exportDirectory = path.join(path.dirname(path.resolve(sourcePath)), 'Final PDFs');
+    await fs.mkdir(exportDirectory, { recursive: true });
+    defaultPath = path.join(exportDirectory, safeName);
+  }
+  const result = await dialog.showSaveDialog(window, { title: kind === 'final-pdf' ? 'Export final PDF' : kind === 'json' ? 'Save workspace' : 'Save a copy', defaultPath, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
   if (result.canceled) return null;
   await fs.writeFile(result.filePath, bytes);
+  if (kind === 'json' && /\.paperdesk\.json$/i.test(result.filePath)) openedPaths.add(path.resolve(result.filePath));
   return { name: path.basename(result.filePath), path: result.filePath };
 });
 ipcMain.handle('pdf:signatures-list', async event => { validSender(event); return readSignatures(); });

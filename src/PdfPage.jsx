@@ -1,6 +1,33 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AnnotationMode, TextLayer } from 'pdfjs-dist';
 import { Check } from 'lucide-react';
+import { fitFontSize, formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
+
+function FittingTextInput({ value, style, ...props }) {
+  const ref = useRef(null);
+  useLayoutEffect(() => {
+    const input = ref.current;
+    if (!input) return;
+    let disposed = false;
+    const fit = () => {
+      if (disposed) return;
+      const base = Number(style?.fontSize) || 11;
+      const computed = getComputedStyle(input);
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      context.font = `${computed.fontWeight} ${base}px ${computed.fontFamily}`;
+      const measured = context.measureText(String(value ?? '')).width;
+      const padding = parseFloat(computed.paddingLeft) + parseFloat(computed.paddingRight) + parseFloat(computed.borderLeftWidth) + parseFloat(computed.borderRightWidth);
+      input.style.fontSize = `${fitFontSize(base, measured, input.clientWidth - padding - 2)}px`;
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(input);
+    document.fonts?.ready.then(fit);
+    return () => { disposed = true; observer.disconnect(); };
+  }, [value, style?.fontSize]);
+  return <input {...props} ref={ref} value={value} style={style} />;
+}
 
 export function FieldInput({ field, value, onChange, compact = false, radioOption, disabled = false, style }) {
   const common = { 'aria-label': field.label, title: field.name, disabled: disabled || field.readOnly, style, onFocus: event => event.target.select?.() };
@@ -15,7 +42,7 @@ export function FieldInput({ field, value, onChange, compact = false, radioOptio
   }
   if (field.type !== 'text') return <span className="readonly-value">{field.type === 'signature' ? 'Digital signature field' : 'Read-only field'}</span>;
   const props = { ...common, value: value ?? '', maxLength: field.maxLength, onChange: event => onChange(event.target.value) };
-  return field.multiline ? <textarea {...props} rows={compact ? 1 : 3} /> : <input {...props} type={field.password ? 'password' : 'text'} />;
+  return field.multiline ? <textarea {...props} rows={compact ? 1 : 3} /> : compact && !field.password ? <FittingTextInput {...props} title={String(value || field.name)} type="text" /> : <input {...props} type={field.password ? 'password' : 'text'} />;
 }
 
 export function Thumbnail({ pdf, pageNumber, current, onClick }) {
@@ -47,7 +74,7 @@ export function Thumbnail({ pdf, pageNumber, current, onClick }) {
   return <button ref={buttonRef} className={`thumbnail ${current ? 'current' : ''}`} aria-label={`Go to page ${pageNumber}`} aria-current={current ? 'page' : undefined} onClick={onClick}><span className="thumbnail-paper"><canvas ref={canvasRef} /></span><span>{pageNumber}</span></button>;
 }
 
-export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
+export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSignField, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
   const hostRef = useRef(null), canvasRef = useRef(null), textRef = useRef(null), paperRef = useRef(null);
   const [hostWidth, setHostWidth] = useState(700);
   const [ready, setReady] = useState(null);
@@ -135,14 +162,22 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
       <div ref={textRef} className="textLayer" />
       {ready && !readOnly && ready.annotations.filter(annotation => annotation.subtype === 'Widget' && !annotation.hidden && !annotation.noView).map(annotation => {
         const field = fields.find(field => field.name === annotation.fieldName);
-        if (!field || ['signature', 'button', 'unsupported'].includes(field.type)) return null;
+        if (!field || ['button', 'unsupported'].includes(field.type)) return null;
         const rect = [...ready.viewport.convertToViewportPoint(annotation.rect[0], annotation.rect[1]), ...ready.viewport.convertToViewportPoint(annotation.rect[2], annotation.rect[3])];
         const left = Math.min(rect[0], rect[2]), top = Math.min(rect[1], rect[3]), width = Math.abs(rect[2] - rect[0]), height = Math.abs(rect[3] - rect[1]);
+        if (field.type === 'signature') {
+          const signed = additions.some(item => item.kind === 'signature' && item.targetField === field.name && item.page === number);
+          const center = (annotation.rect[1] + annotation.rect[3]) / 2;
+          const closestDate = ready.annotations.filter(item => isDateSignedField(fields.find(candidate => candidate.name === item.fieldName)))
+            .sort((a, b) => Math.abs((a.rect[1] + a.rect[3]) / 2 - center) - Math.abs((b.rect[1] + b.rect[3]) / 2 - center))[0];
+          return <div key={annotation.id} className={`pdf-sign-target ${signed ? 'is-filled' : ''}`} style={{ left, top, width, height }}><button type="button" onClick={event => { event.stopPropagation(); onSignField({ fieldName: field.name, page: number, rect: annotation.rect, dateFieldName: closestDate?.fieldName }); }}>{signed ? 'Change' : 'Sign here'}</button></div>;
+        }
         const option = field.radioValues?.[annotation.buttonValue] ?? annotation.buttonValue;
-        return <div key={annotation.id} className={`pdf-field field-${field.type} ${field.multiline ? 'field-multiline' : ''}`} style={{ left, top, width, height }} onClick={event => {
+        const dateSigned = isDateSignedField(field);
+        return <div key={annotation.id} className={`pdf-field field-${field.type} ${field.multiline ? 'field-multiline' : ''} ${dateSigned ? 'date-signed-field' : ''}`} style={{ left, top, width, height }} onClick={event => {
           event.stopPropagation();
           if (event.target === event.currentTarget) event.currentTarget.querySelector('textarea')?.focus();
-        }}><FieldInput compact field={field} value={values[field.name]} radioOption={option} onChange={value => onChange(field.name, value)} style={{ fontSize: Math.max(1, Math.min(annotation.defaultAppearanceData?.fontSize || 11, height / ready.scale * 0.65)) * ready.scale, textAlign: annotation.textAlignment === 1 ? 'center' : annotation.textAlignment === 2 ? 'right' : 'left' }} /></div>;
+        }}><FieldInput compact field={field} value={values[field.name]} radioOption={option} onChange={value => onChange(field.name, value)} style={{ fontSize: Math.max(1, Math.min(annotation.defaultAppearanceData?.fontSize || 11, height / ready.scale * 0.65)) * ready.scale, textAlign: annotation.textAlignment === 1 ? 'center' : annotation.textAlignment === 2 ? 'right' : 'left' }} />{dateSigned && <button className="date-today-button" type="button" title="Fill date signed with today's date" onClick={event => { event.stopPropagation(); onChange(field.name, formatLocalDate()); }}>Today</button>}</div>;
       })}
       {ready && additions.filter(item => item.page === number).map(item => {
         const [left, top] = ready.viewport.convertToViewportPoint(item.x, item.y);
