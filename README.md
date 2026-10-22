@@ -4,7 +4,7 @@ A local Windows Electron app for viewing PDFs, filling standard forms, placing t
 
 ## Run the app
 
-For a local Windows build, run the commands under [Development](#development), then open `release/Paperdesk-PDF-1.0.1.exe`. This is a portable app; it does not require installation. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
+For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. The current build is `Paperdesk-PDF-1.0.1-checkbox-fix.exe`; it does not require installation. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
 
 Version 1.0.1 centers short answers vertically in multiline PDF fields, including dates in tall boxes. The correction applies in the viewer, editable PDF copies, flattened copies, and bulk exports. Square checkbox marks are also drawn as vectors so selected choices stay visible in exported PDFs. Longer entries wrap and scroll in the editor. Existing workspaces remain compatible. Save your work and close the previous version before opening the updated app.
 
