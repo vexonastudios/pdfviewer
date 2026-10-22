@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AnnotationMode, TextLayer } from 'pdfjs-dist';
 import { Check } from 'lucide-react';
 import { fitFontSize, formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
+import { findFlatSignatureTargets } from './lib/signature-targets.mjs';
 
 function FittingTextInput({ value, style, ...props }) {
   const ref = useRef(null);
@@ -74,7 +75,7 @@ export function Thumbnail({ pdf, pageNumber, current, onClick }) {
   return <button ref={buttonRef} className={`thumbnail ${current ? 'current' : ''}`} aria-label={`Go to page ${pageNumber}`} aria-current={current ? 'page' : undefined} onClick={onClick}><span className="thumbnail-paper"><canvas ref={canvasRef} /></span><span>{pageNumber}</span></button>;
 }
 
-export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSignField, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
+export default function PdfPage({ pdf, number, zoom, rotation, fields, values, additions, tool, onChange, onPlace, onSignField, onDateTarget, onSelect, onMove, selected, highlight, readOnly, query, onError }) {
   const hostRef = useRef(null), canvasRef = useRef(null), textRef = useRef(null), paperRef = useRef(null);
   const [hostWidth, setHostWidth] = useState(700);
   const [ready, setReady] = useState(null);
@@ -112,7 +113,9 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
       textLayer = new TextLayer({ textContentSource: page.streamTextContent(), container: textRef.current, viewport });
       await textLayer.render();
       if (disposed) return;
-      setReady({ viewport, annotations, scale }); setRendering(false);
+      const textContent = await page.getTextContent();
+      if (disposed) return;
+      setReady({ viewport, annotations, scale, flatTargets: findFlatSignatureTargets(textContent.items, annotations, number) }); setRendering(false);
     };
     render().catch(error => { if (!disposed && error.name !== 'RenderingCancelledException' && error.name !== 'AbortException') { setRendering(false); onError(error.message); } });
     return () => { disposed = true; task?.cancel(); textLayer?.cancel(); };
@@ -126,7 +129,7 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
   }
   function clickPage(event) {
     if (!ready || readOnly || event.target.closest('input, textarea, select, button, .addition')) return;
-    if (tool === 'text' || tool === 'check' || tool === 'signature') {
+    if (tool === 'text' || tool === 'check' || tool === 'date' || tool === 'signature') {
       const [x, y] = coordinates(event);
       onPlace({ x, y, page: number, rotation: ready.viewport.rotation });
     } else onSelect(null);
@@ -178,6 +181,17 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
           event.stopPropagation();
           if (event.target === event.currentTarget) event.currentTarget.querySelector('textarea')?.focus();
         }}><FieldInput compact field={field} value={values[field.name]} radioOption={option} onChange={value => onChange(field.name, value)} style={{ fontSize: Math.max(1, Math.min(annotation.defaultAppearanceData?.fontSize || 11, height / ready.scale * 0.65)) * ready.scale, textAlign: annotation.textAlignment === 1 ? 'center' : annotation.textAlignment === 2 ? 'right' : 'left' }} />{dateSigned && <button className="date-today-button" type="button" title="Fill date signed with today's date" onClick={event => { event.stopPropagation(); onChange(field.name, formatLocalDate()); }}>Today</button>}</div>;
+      })}
+      {ready && !readOnly && ready.flatTargets.map(target => {
+        const [x1, y1] = ready.viewport.convertToViewportPoint(target.rect[0], target.rect[1]);
+        const [x2, y2] = ready.viewport.convertToViewportPoint(target.rect[2], target.rect[3]);
+        const signed = additions.some(item => item.kind === 'signature' && item.targetField === target.fieldName);
+        const dated = additions.some(item => item.kind === 'text' && item.targetField === `${target.fieldName}:date`);
+        const [dateLeft, dateTop] = ready.viewport.convertToViewportPoint(target.date.x + 125, target.date.y);
+        return <React.Fragment key={target.fieldName}>
+          <div className={`pdf-sign-target flat-sign-target ${signed ? 'is-filled' : ''}`} style={{ left: Math.min(x1, x2), top: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) }}><button type="button" aria-label={`${signed ? 'Change' : 'Sign here'}: ${target.label}, page ${number}`} onClick={event => { event.stopPropagation(); onSignField(target); }}>{signed ? 'Change' : 'Sign here'}</button></div>
+          <button type="button" className="flat-date-today" style={{ left: dateLeft, top: dateTop }} title={`${dated ? 'Update' : 'Fill'} signing date with today’s date`} aria-label={`Use today's date: ${target.label}, page ${number}`} onClick={event => { event.stopPropagation(); onDateTarget(target); }}>Today</button>
+        </React.Fragment>;
       })}
       {ready && additions.filter(item => item.page === number).map(item => {
         const [left, top] = ready.viewport.convertToViewportPoint(item.x, item.y);

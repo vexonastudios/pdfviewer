@@ -1,6 +1,6 @@
 {
   "name": "paperdesk-pdf",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "A local PDF workspace for reading, filling forms, and bulk filling.",
   "author": "Paperdesk",
