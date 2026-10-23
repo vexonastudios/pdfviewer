@@ -4,7 +4,9 @@ A local Windows Electron app for viewing PDFs, filling standard forms, placing t
 
 ## Run the app
 
-For a local Windows build, run the commands under [Development](#development), then open the portable executable in `release/`. Alternatively, keep the entire `release/win-unpacked` folder together and open `Paperdesk PDF.exe` inside it. The build is unsigned. Generated executables and document data are excluded from this source repository.
+Download the portable Windows executable from [GitHub Releases](https://github.com/vexonastudios/pdfviewer/releases/latest) and run it directly; no installer or account is required. The build is unsigned, so Windows may show a publisher warning. For a local build, run the commands under [Development](#development), then open the executable in `release/`.
+
+Releases contain only the application code and bundled open-source assets. Your PDFs, editable workspaces, pasted data, saved signatures, and initials remain on your computer and are excluded from this source repository and release builds.
 
 Version 1.0.4 includes separate locally saved initials, HSEGH caregiver initials targets, and printed-name placement beside flat-form signatures. Existing workspaces remain compatible.
 
