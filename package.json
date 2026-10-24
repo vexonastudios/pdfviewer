@@ -11,7 +11,7 @@
     "build": "node scripts/prepare-assets.mjs && vite build",
     "start": "electron .",
     "test": "node --test tests/*.test.mjs",
-    "package": "node node_modules/electron/install.js && npm run build && electron-builder --win nsis portable --x64 --config electron-builder.config.cjs --config.electronDist=node_modules/electron/dist",
+    "package": "node node_modules/electron/install.js && npm run build && electron-builder --win nsis portable --x64 --config electron-builder.config.cjs --config.electronDist=node_modules/electron/dist --publish never",
     "test:ui": "playwright test"
   },
   "devDependencies": {
