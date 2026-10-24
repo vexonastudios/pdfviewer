@@ -8,6 +8,23 @@ contextBridge.exposeInMainWorld('paperdesk', {
   updatePacketItem: (id, index, filePath) => ipcRenderer.invoke('pdf:packet-update', id, index, filePath),
   exportPacketFile: (id, index, bytes) => ipcRenderer.invoke('pdf:packet-export', id, index, bytes),
   save: data => ipcRenderer.invoke('pdf:save', data),
+  recoverySave: record => ipcRenderer.invoke('pdf:recovery-save', record),
+  recoveryClear: source => ipcRenderer.invoke('pdf:recovery-clear', source),
+  recoveryList: kind => ipcRenderer.invoke('pdf:recovery-list', kind),
+  recoveryRead: (kind, id) => ipcRenderer.invoke('pdf:recovery-read', kind, id),
+  recoveryRemove: (kind, id) => ipcRenderer.invoke('pdf:recovery-remove', kind, id),
+  mergeOpen: () => ipcRenderer.invoke('pdf:merge-open'),
+  checkUpdates: () => ipcRenderer.invoke('pdf:check-updates'),
+  downloadUpdate: () => ipcRenderer.invoke('pdf:download-update'),
+  print: images => ipcRenderer.invoke('pdf:print', images),
+  cancelPrint: () => ipcRenderer.invoke('pdf:print-cancel'),
+  close: () => ipcRenderer.invoke('pdf:close'),
+  onCloseRequest: callback => {
+    const handler = () => callback();
+    ipcRenderer.on('pdf:close-request', handler);
+    return () => ipcRenderer.removeListener('pdf:close-request', handler);
+  },
+  exportPacketBatch: (id, entries) => ipcRenderer.invoke('pdf:packet-export-batch', id, entries),
   listSignatures: () => ipcRenderer.invoke('pdf:signatures-list'),
   saveSignature: record => ipcRenderer.invoke('pdf:signatures-save', record),
   setSignatureWidth: (signer, width, kind) => ipcRenderer.invoke('pdf:signatures-size', signer, width, kind),

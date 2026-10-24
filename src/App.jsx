@@ -14,6 +14,10 @@ import { findFlatInitialTargets } from './lib/initial-targets.mjs';
 import { findFlatSignatureTargets } from './lib/signature-targets.mjs';
 import { findTextMatch } from './lib/search.mjs';
 import { saveBeforeAction } from './lib/workflow.mjs';
+import { createWorkspace, encodeWorkspace, decodeWorkspace, WorkspacePasswordError } from './lib/workspace.mjs';
+import { preflight } from './lib/preflight.mjs';
+import FinalReview from './FinalReview.jsx';
+import { DocumentTools, HistoryList } from './ProfessionalTools.jsx';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 const emptyState = { values: {}, additions: [] };
@@ -51,17 +55,10 @@ function base64(bytes) {
   for (let i = 0; i < bytes.length; i += 32768) text += String.fromCharCode(...bytes.subarray(i, i + 32768));
   return btoa(text);
 }
-function workspaceData(file) {
+async function workspaceData(file, password = '') {
   let bytes = new Uint8Array(file.bytes), name = file.name, restored = null;
   if (name.endsWith('.json')) {
-    const draft = JSON.parse(new TextDecoder().decode(bytes));
-    if (draft.format !== 'paperdesk-workspace-v1' || typeof draft.pdf !== 'string' || typeof draft.name !== 'string' ||
-        !draft.state?.values || typeof draft.state.values !== 'object' || !Array.isArray(draft.state.additions)) {
-      throw new Error('This is not a Paperdesk workspace. Paste bulk-fill JSON into the Bulk fill panel.');
-    }
-    bytes = Uint8Array.from(atob(draft.pdf), char => char.charCodeAt(0));
-    name = draft.name;
-    restored = draft.state;
+    return decodeWorkspace(bytes, password);
   }
   return { bytes, name, restored };
 }
@@ -74,7 +71,8 @@ function Modal({ title, children, onClose, wide = false }) {
     const focusable = () => [...panel.current.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex="0"]')];
     focusable()[0]?.focus();
     function keyboard(event) {
-      if (event.key === 'Escape') closeRef.current?.();
+      if (panel.current !== [...document.querySelectorAll('.modal[role=dialog]')].at(-1)) return;
+      if (event.key === 'Escape') { event.stopImmediatePropagation(); closeRef.current?.(); }
       if (event.key === 'Tab') {
         const nodes = focusable(), first = nodes[0], last = nodes.at(-1);
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
@@ -134,6 +132,10 @@ export default function App() {
   const [busy, setBusy] = useState(''), [toast, setToast] = useState(null), [error, setError] = useState('');
   const [modal, setModal] = useState(null), [pendingAction, setPendingAction] = useState(null);
   const [passwordRequest, setPasswordRequest] = useState(null), [password, setPassword] = useState('');
+  const [workspaceUnlock, setWorkspaceUnlock] = useState(null), [workspaceInput, setWorkspaceInput] = useState(''), [passwordConfirm, setPasswordConfirm] = useState('');
+  const [recoveryStatus, setRecoveryStatus] = useState(''), [updateInfo, setUpdateInfo] = useState(null);
+  const [printPending, setPrintPending] = useState(false);
+  const recoveryWrites = useRef(Promise.resolve()), workspacePasswords = useRef(new Map());
   const [fieldSearch, setFieldSearch] = useState(''), [search, setSearch] = useState(''), [searchResults, setSearchResults] = useState([]), [searching, setSearching] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [signatures, setSignatures] = useState([]), [activeSignature, setActiveSignature] = useState(null), [signTarget, setSignTarget] = useState(null);
@@ -144,6 +146,37 @@ export default function App() {
   const readOnly = Boolean(documentState?.readOnlyReason);
   const fields = documentState?.fields ?? [];
   const additions = state.additions;
+  useEffect(() => {
+    if (!documentState || !dirty || !window.paperdesk || readOnly) return;
+    setRecoveryStatus('Recovery pending…');
+    const timer = setTimeout(() => {
+      const record = { name: documentState.name, sourcePath: documentState.sourcePath, documentId: documentState.id, bytes: base64(new TextEncoder().encode(JSON.stringify(createWorkspace(documentState, state)))) };
+      recoveryWrites.current = recoveryWrites.current.catch(() => {}).then(() => window.paperdesk.recoverySave(record));
+      recoveryWrites.current.then(() => { if (documentRef.current?.id === documentState.id) setRecoveryStatus('Recovery saved'); }, cause => { if (documentRef.current?.id === documentState.id) setRecoveryStatus(`Recovery unavailable: ${cause.message}`); });
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [documentState, state, dirty, readOnly]);
+  async function clearRecovery(document = documentState) {
+    if (!window.paperdesk || !document) return;
+    await recoveryWrites.current.catch(() => {});
+    await window.paperdesk.recoveryClear(document.sourcePath || document.id);
+    if (document.recoveryItem?.kind === 'recovery') await window.paperdesk.recoveryRemove('recovery', document.recoveryItem.id);
+    setRecoveryStatus('');
+  }
+  async function unpackFile(file) {
+    let password = workspacePasswords.current.get(file.path) || '';
+    while (true) {
+      try { const parsed = await workspaceData(file, password); return { ...parsed, workspacePassword: parsed.encrypted ? password : '' }; }
+      catch (cause) {
+        if (!(cause instanceof WorkspacePasswordError)) throw cause;
+        setBusy(''); setWorkspaceInput('');
+        password = await new Promise(resolve => setWorkspaceUnlock({ message: cause.message, resolve }));
+        if (password === null) throw new Error('Workspace opening canceled.');
+        workspacePasswords.current.set(file.path, password);
+        setBusy('Unlocking workspace…');
+      }
+    }
+  }
   const selectedItem = additions.find(item => item.id === selected);
   const selectedSignatureSigner = selectedItem?.kind === 'signature' ? signatureSigner(selectedItem) : null;
   const selectedSavedSignature = signatures.find(record => record.signer === selectedSignatureSigner && inkKind(record) === inkKind(selectedItem) && record.dataUrl === selectedItem?.dataUrl);
@@ -266,14 +299,14 @@ export default function App() {
   function applyValues(values, current = state) {
     const nextValues = { ...current.values };
     for (const field of fields) if (Object.hasOwn(values, field.name)) nextValues[field.name] = values[field.name];
-    return { values: nextValues, additions: current.additions.map(item => Object.hasOwn(values, `Text: ${item.label}`) ? { ...item, text: String(values[`Text: ${item.label}`]) } : item) };
+    return { ...current, values: nextValues, additions: current.additions.map(item => Object.hasOwn(values, `Text: ${item.label}`) ? { ...item, text: String(values[`Text: ${item.label}`]) } : item) };
   }
   async function loadFile(file) {
     if (!file) return false;
     setBusy('Opening your PDF…'); setError('');
     let candidate;
     try {
-      let { bytes, name, restored } = workspaceData(file);
+      let { bytes, name, restored, workspacePassword = '' } = await unpackFile(file);
       if (bytes.length > 300 * 1024 * 1024) throw new Error('Choose a PDF smaller than 300 MB.');
       candidate = getDocument({ data: bytes.slice(), cMapUrl: new URL('./pdfjs/cmaps/', document.baseURI).href, cMapPacked: true, standardFontDataUrl: new URL('./pdfjs/standard_fonts/', document.baseURI).href, wasmUrl: new URL('./pdfjs/wasm/', document.baseURI).href, iccUrl: new URL('./pdfjs/iccs/', document.baseURI).href, isEvalSupported: false, enableXfa: true });
       loadTask.current = candidate;
@@ -291,14 +324,14 @@ export default function App() {
           const mapping = Object.fromEntries(info.fields.filter(field => !field.readOnly).map(field => [field.name, field.name]));
           const checked = previewRecord(restored.values, mapping, info.fields);
           if (checked.errors.length) throw new Error(`This workspace contains invalid field values: ${checked.errors.join(' ')}`);
-          restored = { values: { ...Object.fromEntries(info.fields.map(field => [field.name, field.value])), ...checked.values }, additions: restored.additions };
+          restored = { values: { ...Object.fromEntries(info.fields.map(field => [field.name, field.value])), ...checked.values }, additions: restored.additions, ...(restored.ocr ? { ocr: restored.ocr } : {}) };
         }
       }
       const initial = restored || { values: Object.fromEntries(info.fields.map(field => [field.name, field.value])), additions: [] };
       const previous = documentRef.current;
-      const next = { pdf, bytes, name, sourcePath: file.path, workspacePath: file.name.endsWith('.paperdesk.json') ? file.path : null, ...info, id: crypto.randomUUID() };
+      const next = { pdf, bytes, name, workspacePassword, recoveryItem: file.recoveryItem, sourcePath: file.path, workspacePath: file.name.endsWith('.paperdesk.json') && !file.recovered ? file.path : null, ...info, id: crypto.randomUUID() };
       documentRef.current = next; setDocument(next);
-      setHistory({ past: [], present: initial, future: [] }); setSaved(fingerprint(initial));
+      setHistory({ past: [], present: initial, future: [] }); setSaved(file.recovered ? '__recovered__' : fingerprint(initial)); setRecoveryStatus('');
       setPage(1); setZoom('fit'); setRotation(0); setSelected(null); setTool('select'); setSignTarget(null); setSearch(''); setSearchResults([]); searchRun.current++; setSearching(false); setFieldSearch(''); setTab('fields');
       previous?.pdf.loadingTask.destroy();
       notify(`${name} is ready`);
@@ -333,52 +366,53 @@ export default function App() {
     if (!review?.root || dirty) return;
     const ready = review.items.map((item, index) => item.ready ? index : -1).filter(index => index >= 0);
     if (!ready.length) return;
-    setBusy(`Exporting 0 of ${ready.length} reviewed PDFs…`);
+    setBusy('Checking the packet before export…');
+    const entries = [];
     try {
-      const fontBytes = await getFont();
-      for (let position = 0; position < ready.length; position++) {
-        const index = ready[position];
-        setBusy(`Exporting ${position + 1} of ${ready.length}: ${review.items[index].name}`);
-        let bytes, descriptors, values, marks, readOnlyReason;
-        if (index === review.index) {
-          ({ bytes, fields: descriptors, readOnlyReason } = documentState);
-          ({ values, additions: marks } = state);
-        } else {
-          const file = await window.paperdesk.reviewFile(review.id, index);
-          const parsed = workspaceData(file);
-          bytes = parsed.bytes;
-          const inspected = await inspectPdf(bytes);
-          ({ fields: descriptors, readOnlyReason } = inspected);
-          const mapping = Object.fromEntries(descriptors.filter(field => !field.readOnly).map(field => [field.name, field.name]));
-          const checked = parsed.restored ? previewRecord(parsed.restored.values, mapping, descriptors) : { values: {} };
-          if (checked.errors?.length) throw new Error(`${review.items[index].name}: ${checked.errors.join(' ')}`);
-          values = { ...Object.fromEntries(descriptors.map(field => [field.name, field.value])), ...checked.values };
-          marks = parsed.restored?.additions || [];
+      let total = 0;
+      for (const index of ready) {
+        setBusy(`Checking ${entries.length + 1} of ${ready.length}: ${review.items[index].name}`);
+        let doc = documentState, current = state, owned = false;
+        if (index !== review.index) {
+          const file = await window.paperdesk.reviewFile(review.id, index), parsed = await unpackFile(file);
+          const inspected = await inspectPdf(parsed.bytes);
+          const task = getDocument({ data: parsed.bytes.slice(), isEvalSupported: false });
+          const pdf = await task.promise;
+          owned = true;
+          doc = { ...inspected, pdf, bytes: parsed.bytes, name: parsed.name };
+          const mapping = Object.fromEntries(doc.fields.filter(field => !field.readOnly).map(field => [field.name, field.name]));
+          const checked = parsed.restored ? previewRecord(parsed.restored.values, mapping, doc.fields) : { values: {} };
+          if (checked.errors?.length) { await pdf.destroy(); throw new Error(`${doc.name}: ${checked.errors.join(' ')}`); }
+          current = { values: { ...Object.fromEntries(doc.fields.map(field => [field.name, field.value])), ...checked.values }, additions: parsed.restored?.additions || [] };
         }
         try {
-          const output = readOnlyReason ? bytes : await writePdf(bytes, descriptors, values, marks, { flatten: true, fontBytes });
-          await window.paperdesk.exportPacketFile(review.id, index, output);
-          setReview(current => current?.id === review.id ? { ...current, items: current.items.map((item, i) => i === index ? { ...item, exported: true, ready: false } : item) } : current);
-        } catch (cause) { throw new Error(`${review.items[index].name}: ${cause.message}`); }
+          const issues = await preflight(doc.pdf, doc.fields, current, doc.readOnlyReason);
+          const bytes = doc.readOnlyReason ? doc.bytes : await writePdf(doc.bytes, doc.fields, current.values, current.additions, { flatten: true, fontBytes: await getFont() });
+          total += bytes.length;
+          if (total > 500 * 1024 * 1024) throw new Error('This packet exceeds 500 MB. Export a smaller group.');
+          entries.push({ bytes, issues, name: doc.name, index, copy: Boolean(doc.readOnlyReason), previewPdf: !owned && doc.readOnlyReason ? doc.pdf : undefined });
+        } finally { if (owned) await doc.pdf.destroy(); }
       }
-      notify(`${ready.length} final PDF${ready.length === 1 ? '' : 's'} saved in the packet’s Final PDFs folder.`);
-    } catch (cause) { setError(`Packet export stopped: ${cause.message}`); }
+      setModal({ type: 'final-review', entries, packetId: review.id });
+    } catch (cause) { setError(`Packet check stopped: ${cause.message}`); }
     finally { setBusy(''); }
   }
   useEffect(() => {
-    window.paperdesk?.initialFile().then(async open => { if (open && await loadFile(open.file)) setReview(open.review ? { ...open.review, index: 0 } : null); }).catch(error => setError(error.message));
+    window.paperdesk?.initialFile().then(async open => { if (open && await loadFile(open.file)) setReview(open.review ? { ...open.review, index: 0 } : null); else if (!open && (await window.paperdesk.recoveryList('recovery')).length) setModal('recovery'); }).catch(error => setError(error.message));
     return () => { documentRef.current?.pdf.loadingTask.destroy(); };
   }, []);
   useEffect(() => window.paperdesk?.onOpen(file => guard(async () => { if (await loadFile(file)) setReview(null); })), [dirty]);
   useEffect(() => window.paperdesk?.onReview(open => guard(async () => { if (await loadFile(open.file)) setReview({ ...open.review, index: 0 }); })), [dirty]);
+  useEffect(() => window.paperdesk?.onCloseRequest(() => guard(() => window.paperdesk.close())), [dirty]);
   useEffect(() => {
     const keyboard = event => {
       if (modal || passwordRequest || busy) return;
       const editing = /INPUT|TEXTAREA|SELECT/.test(event.target.tagName);
       if (event.ctrlKey || event.metaKey) {
         if (event.key.toLowerCase() === 'o') { event.preventDefault(); open(); }
-        if (event.key.toLowerCase() === 's' && documentState) { event.preventDefault(); readOnly ? setModal('export') : saveWorkspace(); }
+        if (event.key.toLowerCase() === 's' && documentState) { event.preventDefault(); readOnly ? prepareExport() : saveWorkspace(); }
         if (event.key.toLowerCase() === 'f' && documentState) { event.preventDefault(); setTab('search'); setTimeout(() => document.getElementById('document-search')?.focus(), 50); }
+        if (event.key.toLowerCase() === 'p' && documentState && window.paperdesk) { event.preventDefault(); printDocument(); }
         if (event.key.toLowerCase() === 'z' && !editing) { event.preventDefault(); event.shiftKey ? redo() : undo(); }
         if (event.key.toLowerCase() === 'y' && !editing) { event.preventDefault(); redo(); }
       }
@@ -391,22 +425,84 @@ export default function App() {
     };
     window.addEventListener('keydown', keyboard); return () => window.removeEventListener('keydown', keyboard);
   });
-  async function exportFinal() {
-    setBusy('Preparing and verifying your final PDF…');
+  async function prepareExport() {
+    setBusy('Checking and rendering your final PDF…');
     try {
-      const bytes = readOnly ? documentState.bytes : await writePdf(documentState.bytes, fields, state.values, additions, { flatten: true, fontBytes: await getFont() });
-      const result = await saveArtifact(bytes, `${fileStem(documentState.name)}-final.pdf`, readOnly ? 'pdf' : 'final-pdf', { sourcePath: documentState.sourcePath });
-      if (result) { setModal(null); notify({ message: `Exported ${result.name}`, path: result.path }); }
-    } catch (error) { setError(error.message); } finally { setBusy(''); }
+      const issues = await preflight(documentState.pdf, fields, state, documentState.readOnlyReason);
+      const bytes = readOnly ? documentState.bytes : await materialize();
+      setModal({ type: 'final-review', entries: [{ bytes, issues, name: documentState.name, copy: readOnly, previewPdf: readOnly ? documentState.pdf : undefined }] });
+    } catch (cause) { setError(cause.message); } finally { setBusy(''); }
   }
-  async function saveWorkspace() {
+  async function materialize() {
+    return writePdf(documentState.bytes, fields, state.values, additions, { flatten: true, fontBytes: await getFont() });
+  }
+  async function prepareExtra(file) {
+    const info = await inspectPdf(file.bytes);
+    if (info.readOnlyReason) throw new Error(`${file.name}: cannot merge a protected, signed, or unsupported document.`);
+    return writePdf(file.bytes, info.fields, Object.fromEntries(info.fields.map(field => [field.name, field.value])), [], { flatten: true, fontBytes: await getFont() });
+  }
+  async function exportPrepared() {
+    if (modal?.type !== 'final-review') return;
+    setBusy('Saving verified PDFs…');
+    try {
+      if (modal.packetId) {
+        const result = await window.paperdesk.exportPacketBatch(modal.packetId, modal.entries.map(({ bytes, index, copy }) => ({ bytes, index, copy })));
+        const done = new Set(modal.entries.map(entry => entry.index));
+        setReview(current => ({ ...current, items: current.items.map((item, index) => done.has(index) ? { ...item, ready: false, exported: true } : item) }));
+        notify({ message: `${result.count} PDFs and an export manifest saved in Final PDFs.`, path: result.path });
+        setModal(null);
+      } else {
+        const entry = modal.entries[0];
+        const result = await saveArtifact(entry.bytes, `${fileStem(entry.name)}-${entry.copy ? 'copy' : 'final'}.pdf`, entry.copy ? 'copy-pdf' : 'final-pdf', { sourcePath: documentState.sourcePath });
+        if (result) { setModal(null); notify({ message: `Exported ${result.name}`, path: result.path }); }
+      }
+    } catch (cause) { setError(cause.message); } finally { setBusy(''); }
+  }
+  async function printDocument() {
+    if (printPending) return;
+    setBusy('Preparing pages for printing…');
+    let printed;
+    try {
+      const bytes = readOnly ? documentState.bytes : await materialize();
+      printed = readOnly ? documentState.pdf : await getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
+      if (printed.numPages > 300) throw new Error('Print no more than 300 pages at a time. Use page tools to extract a smaller document.');
+      const images = [];
+      for (let number = 1; number <= printed.numPages; number++) {
+        setBusy(`Preparing print page ${number} of ${printed.numPages}…`);
+        const page = await printed.getPage(number), size = page.getViewport({ scale: 1 });
+        const scale = Math.min(2, Math.sqrt(16_000_000 / (size.width * size.height))), viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas'); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        images.push({ data: canvas.toDataURL('image/png'), width: size.width, height: size.height }); canvas.width = canvas.height = 0;
+      }
+      setBusy(''); setPrintPending(true);
+      if (await window.paperdesk.print(images)) notify('Document sent to the printer.');
+    } catch (cause) { setError(cause.message); } finally { if (printed && printed !== documentState.pdf) await printed.destroy(); setBusy(''); setPrintPending(false); }
+  }
+  async function restoreVersion(kind, item) {
+    guard(async () => {
+      try {
+        const record = await window.paperdesk.recoveryRead(kind, item.id);
+        setModal(null);
+        if (await loadFile({ name: record.name, bytes: record.bytes, recovered: true, recoveryItem: { kind, id: item.id } })) { setReview(null); notify('Recovered draft opened. Save it to keep this version.'); }
+      } catch (cause) { setError(cause.message); }
+    });
+  }
+  async function checkUpdates() {
+    try { setBusy('Checking GitHub for updates…'); setUpdateInfo(await window.paperdesk.checkUpdates()); setModal('updates'); }
+    catch (cause) { setError(cause.message); } finally { setBusy(''); }
+  }
+  async function saveWorkspace(passwordOverride) {
     if (readOnly) return;
     setBusy('Saving your editable work…');
     try {
-      const json = JSON.stringify({ format: 'paperdesk-workspace-v1', name: documentState.name, pdf: base64(documentState.bytes), state });
-      const result = await saveArtifact(new TextEncoder().encode(json), `${fileStem(documentState.name)}.paperdesk.json`, 'json', { overwritePath: documentState.workspacePath, sourcePath: documentState.sourcePath });
+      const workspacePassword = typeof passwordOverride === 'string' ? passwordOverride : documentState.workspacePassword || '';
+      const bytes = await encodeWorkspace(createWorkspace(documentState, state), workspacePassword);
+      const result = await saveArtifact(bytes, `${fileStem(documentState.name)}.paperdesk.json`, 'json', { overwritePath: documentState.workspacePath, sourcePath: documentState.sourcePath });
       if (result) {
-        if (result.path) setDocument(current => { const next = { ...current, sourcePath: result.path, workspacePath: result.path }; documentRef.current = next; return next; });
+        await clearRecovery();
+        if (result.path) { workspacePasswords.current.set(result.path, workspacePassword); setDocument(current => { const next = { ...current, workspacePassword, sourcePath: result.path, workspacePath: result.path }; documentRef.current = next; return next; }); }
+        else setDocument(current => { const next = { ...current, workspacePassword }; documentRef.current = next; return next; });
         if (result.path && review?.root) {
           try {
             const item = await window.paperdesk.updatePacketItem(review.id, review.index, result.path);
@@ -456,7 +552,7 @@ export default function App() {
         const page = await documentState.pdf.getPage(i);
         const content = await page.getTextContent();
         if (run !== searchRun.current) return;
-        const match = findTextMatch(content.items.map(item => ({ text: item.str || '', hasEOL: item.hasEOL })), query);
+        const match = findTextMatch(content.items.map(item => ({ text: item.str || '', hasEOL: item.hasEOL })), query) || findTextMatch([{ text: state.ocr?.[i]?.text || '' }], query);
         if (match) results.push({ page: i, snippet: `${match.start > 45 ? '…' : ''}${match.text.slice(Math.max(0, match.start - 45), match.end + 90).replace(/\s+/g, ' ')}…` });
       }
       if (run === searchRun.current) setSearchResults(results);
@@ -547,8 +643,8 @@ export default function App() {
   return <div className={`app ${documentState ? 'has-document' : ''}`} onDragEnter={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); dragCount.current++; setDragging(true); } }} onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDragLeave={event => { event.preventDefault(); dragCount.current--; if (dragCount.current <= 0) setDragging(false); }} onDrop={event => { event.preventDefault(); dragCount.current = 0; setDragging(false); if (!busy) browserFile(event.dataTransfer.files[0]); }}>
     <input ref={inputRef} className="visually-hidden" type="file" accept=".pdf,.paperdesk.json" aria-label="Choose PDF file" onChange={event => { browserFile(event.target.files?.[0]); event.target.value = ''; }} />
     <header className="app-header"><button className="brand" title="Paperdesk home" onClick={() => guard(() => { const previous = documentRef.current; documentRef.current = null; setDocument(null); setReview(null); setHistory({ past: [], present: emptyState, future: [] }); setSaved(fingerprint(emptyState)); previous?.pdf.loadingTask.destroy(); })}><span className="brand-mark"><FileText size={23} strokeWidth={1.7} /></span><span>paperdesk<span className="brand-pdf">PDF</span></span></button>
-      <div className="header-center">{documentState ? <><FileText size={15} /><span title={documentState.name}>{documentState.name}</span><span className={`save-status ${dirty ? 'unsaved' : ''}`}>{dirty ? 'Unsaved changes' : 'All set'}</span></> : <span className="header-tagline">A little less paperwork.</span>}</div>
-      <div className="header-actions"><button className="icon-button help-button" aria-label="Help" onClick={() => setModal('help')}><HelpCircle size={19} /></button><button className="secondary" onClick={open} disabled={Boolean(busy)}><FolderOpen size={16} /> Open PDF</button>{window.paperdesk && <button className="secondary" onClick={openPacket} disabled={Boolean(busy)}><FileStack size={16} /> Open packet</button>}{documentState && <>{!readOnly && <button className="secondary" onClick={saveWorkspace} disabled={Boolean(busy)}><Save size={16} /> Save</button>}<button className="primary" onClick={() => setModal('export')} disabled={Boolean(busy)}><Download size={16} /> {readOnly ? 'Save a copy' : 'Export final PDF'}</button></>}</div>
+      <div className="header-center">{documentState ? <><FileText size={15} /><span title={documentState.name}>{documentState.name}</span><span className={`save-status ${dirty ? 'unsaved' : ''}`}>{dirty ? 'Unsaved changes' : documentState.workspacePath ? 'Saved' : 'Ready'}{documentState.workspacePassword ? ' · Protected' : ''}</span></> : <span className="header-tagline">A little less paperwork.</span>}</div>
+      <div className="header-actions">{documentState && <button className="secondary" disabled={Boolean(busy)} onClick={() => setModal('tools')}>Tools</button>}<button className="icon-button help-button" aria-label="Help" onClick={() => setModal('help')}><HelpCircle size={19} /></button><button className="secondary" onClick={open} disabled={Boolean(busy)}><FolderOpen size={16} /> Open PDF</button>{window.paperdesk && <button className="secondary" onClick={openPacket} disabled={Boolean(busy)}><FileStack size={16} /> Open packet</button>}{documentState && <>{!readOnly && <button className="secondary" onClick={saveWorkspace} disabled={Boolean(busy)}><Save size={16} /> Save</button>}<button className="primary" onClick={prepareExport} disabled={Boolean(busy)}><Download size={16} /> {readOnly ? 'Save a copy' : 'Export final PDF'}</button></>}</div>
     </header>
     {review && documentState && <><nav className="review-queue" aria-label="Document review queue"><span className="review-queue-title">REVIEW QUEUE</span><strong>{review.index + 1} of {review.items.length}</strong><select aria-label="Jump to form" value={review.index} onChange={event => showReviewItem(Number(event.target.value))} disabled={Boolean(busy)}>{review.items.map((item, index) => <option key={index} value={index}>{index + 1}. {item.location || reviewLabel(item.name)} {item.ready ? '· Ready' : item.exported ? '· Final saved' : ''}</option>)}</select><button className="secondary" onClick={() => showReviewItem(review.index - 1)} disabled={review.index === 0 || Boolean(busy)}><ChevronLeft size={16} /> Previous form</button><button className="primary" onClick={() => showReviewItem(review.index + 1)} disabled={review.index === review.items.length - 1 || Boolean(busy)}>Next form <ChevronRight size={16} /></button></nav>{review.root && <div className="packet-checks"><span>{reviewTargets?.id === documentState.id ? reviewIssues.length ? `Check before export: ${reviewIssues.join(' · ')}` : 'No obvious blanks found. Review the page before marking ready.' : 'Checking fields, signing lines, and initials…'}</span><button className="secondary" disabled={Boolean(busy) || dirty || reviewTargets?.id !== documentState.id} onClick={() => setReview(current => ({ ...current, items: current.items.map((item, index) => index === current.index ? { ...item, ready: !item.ready } : item) }))}>{review.items[review.index].ready ? 'Unmark ready' : 'Mark reviewed'}</button><button className="primary" disabled={Boolean(busy) || dirty || !review.items.some(item => item.ready)} onClick={exportPacketFinals}>Export {review.items.filter(item => item.ready).length} reviewed finals</button></div>}</>}
     {!documentState ? <main className="welcome"><div className="welcome-main"><span className="welcome-kicker"><span /> YOUR EVERYDAY PDF WORKSPACE</span><h1>Paperwork,<br /><em>without the work.</em></h1><p className="welcome-description">Open it. Fill it. Make it yours.<br />A simpler home for your PDFs, right on your computer.</p><div className="drop-card" onClick={open} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } }} role="button" tabIndex={0} aria-label="Open a PDF"><div className="drop-icon"><FileText size={30} strokeWidth={1.4} /><span><Plus size={13} /></span></div><div><h2>Drop your PDF here</h2><p>or click to choose a file</p></div><span className="drop-arrow"><ArrowUpRight size={22} /></span></div><div className="welcome-under"><span><LockKeyhole size={13} /> Files stay on your computer</span><button className="text-button" onClick={() => guard(async () => { try { setBusy('Creating a practice form…'); await loadFile({ name: 'Welcome to Paperdesk.pdf', bytes: await createSample() }); } catch (error) { setBusy(''); setError(error.message); } })}>Try a practice form <ArrowRight size={14} /></button></div></div>
@@ -565,7 +661,7 @@ export default function App() {
         <PdfPage pdf={documentState.pdf} number={page} zoom={zoom} rotation={rotation} fields={fields} values={state.values} additions={additions} tool={tool} onChange={changeValue} onPlace={place} onSignField={target => { if (tool === 'signature' && activeSignature) placeSignatureInField(activeSignature, target); else { setSignTarget(target); setTool('select'); setModal('signatures'); } }} onInitialField={target => { if (tool === 'initials' && activeSignature) placeInitialInField(activeSignature, target); else { setSignTarget(target); setTool('select'); setModal('initials'); } }} onDateTarget={fillFlatSigningDate} onSelect={setSelected} onMove={updateItem} selected={selected} highlight={highlight} readOnly={readOnly} query={tab === 'search' ? search.trim() : ''} onError={setError} />
         <aside className="inspector"><div className="panel-tabs" role="tablist" aria-label="Document tools"><button role="tab" aria-selected={tab === 'fields'} className={tab === 'fields' ? 'active' : ''} onClick={() => setTab('fields')}><List size={16} /> Fields</button><button role="tab" aria-selected={tab === 'bulk'} className={tab === 'bulk' ? 'active' : ''} onClick={() => setTab('bulk')} disabled={readOnly}><Sparkles size={16} /> Bulk fill</button><button role="tab" aria-selected={tab === 'search'} className={tab === 'search' ? 'active search-tab' : 'search-tab'} onClick={() => setTab('search')} title="Find text (Ctrl+F)" aria-label="Find text"><Search size={17} /></button></div>
           <BulkPanel key={documentState.id} active={tab === 'bulk'} fields={allFields} busy={Boolean(busy)} duplicateNames={duplicateNames} onApply={values => { update(current => applyValues(values, current)); notify(`${Object.keys(values).length} field values applied. Review the page before saving.`); }} onBatch={batch} onCopy={copySchema} />
-          {tab === 'search' ? <div className="panel-body"><div className="section-eyebrow">FIND YOUR PLACE</div><h2>Search this PDF</h2><form onSubmit={findText} className="search-form"><input id="document-search" aria-label="Search document text" placeholder="Find a word or phrase…" value={search} onChange={event => { setSearch(event.target.value); setSearchResults([]); searchRun.current++; setSearching(false); }} /><button className="primary" disabled={searching || !search.trim()} aria-label="Search"><Search size={16} /></button></form><p className="tiny muted">Searches existing document text. Scanned images need OCR, which this version does not include.</p>{searching ? <p className="muted">Searching pages…</p> : <><div className="section-heading"><h3>Matching pages</h3><span className="pill">{searchResults.length}</span></div>{searchResults.map(result => <button key={result.page} className="search-result" onClick={() => setPage(result.page)}><strong>Page {result.page}</strong><span>{result.snippet}</span></button>)}</>}</div> : tab === 'fields' ? <div className="panel-body fields-panel">
+          {tab === 'search' ? <div className="panel-body"><div className="section-eyebrow">FIND YOUR PLACE</div><h2>Search this PDF</h2><form onSubmit={findText} className="search-form"><input id="document-search" aria-label="Search document text" placeholder="Find a word or phrase…" value={search} onChange={event => { setSearch(event.target.value); setSearchResults([]); searchRun.current++; setSearching(false); }} /><button className="primary" disabled={searching || !search.trim()} aria-label="Search"><Search size={16} /></button></form><p className="tiny muted">Searches existing document text. For scanned pages, use Tools → Recognize text first.</p>{searching ? <p className="muted">Searching pages…</p> : <><div className="section-heading"><h3>Matching pages</h3><span className="pill">{searchResults.length}</span></div>{searchResults.map(result => <button key={result.page} className="search-result" onClick={() => setPage(result.page)}><strong>Page {result.page}</strong><span>{result.snippet}</span></button>)}</>}</div> : tab === 'fields' ? <div className="panel-body fields-panel">
             {selectedItem && <section className="added-editor"><div className="section-heading"><h3>{selectedItem.kind === 'text' ? 'Your text box' : selectedItem.kind === 'signature' ? selectedItem.label : 'Your checkmark'}</h3><button className="icon-button" aria-label="Delete selected item" onClick={() => { removeSelected(); }}><Trash2 size={16} /></button></div>{selectedItem.kind === 'text' && <><label className="input-label" htmlFor="added-text-value">Text</label><textarea id="added-text-value" rows={3} value={selectedItem.text} onChange={event => updateItem(selectedItem.id, { text: event.target.value })} /><label className="input-label" htmlFor="added-text-label">Field name <span>for bulk filling</span></label><input id="added-text-label" value={selectedItem.label} onChange={event => updateItem(selectedItem.id, { label: event.target.value })} /></>}{selectedItem.kind === 'signature' ? <><label className="input-label" htmlFor="signature-width">{inkKind(selectedItem) === 'initials' ? 'Initials width' : 'Signature width'}</label><input id="signature-width" type="range" min={inkKind(selectedItem) === 'initials' ? 5 : 20} max="350" value={selectedItem.width} onChange={event => resizeSignature(selectedItem, Number(event.target.value))} onPointerUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} onKeyUp={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} onBlur={() => selectedSignatureSigner && flushSignatureWidth(selectedSignatureSigner, inkKind(selectedItem))} /><span className="tiny muted">{Math.round(selectedItem.width)} pt wide</span>{selectedSavedSignature && <p className="tiny muted">This size is saved for {selectedSignatureSigner}’s next {inkKind(selectedItem)}.</p>}</> : <><label className="input-label" htmlFor="text-size">{selectedItem.kind === 'text' ? 'Font size' : 'Size'}</label><select id="text-size" value={selectedItem.size} onChange={event => updateItem(selectedItem.id, { size: Number(event.target.value) })}>{[6, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72, 96].map(size => <option key={size} value={size}>{size} pt</option>)}</select></>}<p className="tiny muted">Drag on the page to reposition. Save a workspace to keep placements editable.</p></section>}
             <div className="section-eyebrow">MAKE IT COMPLETE</div><div className="section-heading"><h2>Form fields</h2><span className="pill">{editableCount}</span></div><p className="muted">{editableCount ? 'Fill here or click a field on the page.' : 'This page can still be filled out.'}</p>
             {editableCount > 0 && <><div className="progress-track"><span style={{ width: `${filledCount / editableCount * 100}%` }} /></div><div className="progress-label"><span>{filledCount} of {editableCount} fields have values</span><span>{Math.round(filledCount / editableCount * 100)}%</span></div><label className="toggle-label"><input type="checkbox" checked={highlight} onChange={event => setHighlight(event.target.checked)} /> Highlight fields on page</label><div className="field-filter"><Search size={15} /><input aria-label="Filter form fields" placeholder="Find a field…" value={fieldSearch} onChange={event => setFieldSearch(event.target.value)} /></div></>}
@@ -577,18 +673,19 @@ export default function App() {
         </aside>
       </main>
     </>}
-    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : 'Changes are saved only when you choose Save'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.0.5</>}</span></footer>
+    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : dirty ? recoveryStatus || 'Unsaved changes' : documentState.workspacePath ? 'Editable draft saved' : 'Ready to fill or export'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.1.0</>}</span></footer>
     {dragging && <div className="drop-overlay"><FileText size={48} /><h2>Drop it here. We’ll take it from there.</h2><p>PDF or Paperdesk workspace</p></div>}
     {toast && <div className="toast" role="status"><CheckCircle2 size={19} /><span>{toast.message}</span>{toast.path && <button onClick={() => window.paperdesk?.showOutput(toast.path)}>Show file</button>}<button className="icon-button" aria-label="Dismiss notification" onClick={() => setToast(null)}><X size={16} /></button></div>}
     {(modal === 'signatures' || modal === 'initials') && <SignatureDialog signatures={signatures} kind={modal === 'initials' ? 'initials' : 'signature'} target={signTarget} pageCount={documentState?.pdf.numPages || 1} onSave={saveSignature} onRemove={removeSignature} onPlace={record => { if (signTarget) modal === 'initials' ? placeInitialInField(record, signTarget) : placeSignatureInField(record, signTarget); else { setActiveSignature(record); setTool(modal === 'initials' ? 'initials' : 'signature'); setModal(null); } }} onPlaceAll={record => placeInitialsOnAllPages(record, signTarget)} onClose={() => { setModal(null); setSignTarget(null); }} />}
-    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content"><p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Use Open packet to review a whole folder in order.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature, printed name where requested, and signing date when it can safely match the date field. Use Today beside a signing date to set it separately. Review before saving.</p><p><b>4. Initial reports.</b> Click Initial in the toolbar to draw or import each person's initials. On a HSEGH page, click Initial above either caregiver blank. Choose Initial here for that page, or All pages after you have reviewed the complete report. Each person's initials are saved separately from their full signature.</p><p><b>5. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>6. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF. In a packet, Save each form, mark it reviewed, then export the reviewed finals together. Long answers that cannot fit readably stop export so you can shorten them.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures and initials. It does not include OCR, certificate signing, or editing existing page text. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
-    {modal === 'export' && <Modal title={readOnly ? 'Save a PDF copy' : 'Export final PDF'} onClose={busy ? null : () => setModal(null)}>
-      <p className="muted">{readOnly ? 'This file is view-only. Save a separate PDF copy.' : 'Create one finished PDF for this form, with answers and signatures fixed on the page.'}</p>
-      {!readOnly && <><div className="notice small"><b>Finals folder:</b> <code className="final-folder">{finalFolder(documentState.sourcePath) || 'Choose a folder in the Save dialog'}</code></div><p className="tiny muted">Flattening removes editable form fields. Another PDF editor could still change the file.</p></>}
-      <button className="primary full" onClick={exportFinal} disabled={Boolean(busy)}><Download size={17} /> {readOnly ? 'Save PDF copy' : 'Export flattened PDF'}</button>
-      <p className="tiny muted">Your draft stays editable. Exporting does not overwrite it.</p>
-    </Modal>}
-    {modal === 'discard' && <Modal title="You have unsaved changes" onClose={() => { setModal(null); setPendingAction(null); }}><p className="muted">Use Save first if you want to keep editing the details you entered.</p><div className="modal-actions"><button className="secondary" onClick={() => { const action = pendingAction; setModal(null); setPendingAction(null); action?.(); }}>Discard changes</button><button className="primary" onClick={async () => { const action = pendingAction; if (await saveBeforeAction(saveWorkspace, action)) setPendingAction(null); }}>Save first</button></div></Modal>}
+    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content">{window.paperdesk && <div className="tool-actions"><button className="secondary" onClick={checkUpdates}>Check for updates</button><button className="secondary" onClick={() => setModal('recovery')}>Recovery drafts</button></div>}<p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Use Open packet to review a whole folder in order.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature, printed name where requested, and signing date when it can safely match the date field. Use Today beside a signing date to set it separately. Review before saving.</p><p><b>4. Initial reports.</b> Click Initial in the toolbar to draw or import each person's initials. On a HSEGH page, click Initial above either caregiver blank. Choose Initial here for that page, or All pages after you have reviewed the complete report. Each person's initials are saved separately from their full signature.</p><p><b>5. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>6. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF. In a packet, Save each form, mark it reviewed, then export the reviewed finals together. Long answers that cannot fit readably stop export so you can shorten them.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures and initials. Tools includes local English OCR, page arrangement, merging, printing, protected workspaces, and recovery history. Certificate signing and editing existing page text are not included. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
+    {modal?.type === 'final-review' && <Modal title="Review before export" wide onClose={busy ? null : () => setModal(null)}><FinalReview entries={modal.entries} onExport={exportPrepared} onError={setError} busy={Boolean(busy)} /></Modal>}
+    {modal === 'tools' && <Modal title="Document tools" onClose={() => setModal(null)}><DocumentTools documentState={documentState} state={state} readOnly={readOnly} onMaterialize={materialize} onPrepareExtra={prepareExtra} onOrganize={bytes => guard(async () => { setModal(null); if (await loadFile({ name: `${fileStem(documentState.name)}-arranged.pdf`, bytes, recovered: true })) setReview(null); })} onPassword={() => { setWorkspaceInput(''); setPasswordConfirm(''); setModal('protect'); }} onHistory={() => setModal('history')} onPrint={printDocument} printPending={printPending} onCancelPrint={() => window.paperdesk.cancelPrint()} onShowOcr={() => setModal('ocr-text')} onOcr={result => { update(current => ({ ...current, ocr: { ...current.ocr, ...result } })); setModal('ocr-text'); }} onBusy={setBusy} onError={setError} onClose={() => {}} /></Modal>}
+    {(modal === 'recovery' || modal === 'history') && <Modal title={modal === 'history' ? 'Saved versions' : 'Recover unfinished work'} onClose={() => setModal(null)}><HistoryList kind={modal} onRestore={restoreVersion} onError={setError} /></Modal>}
+    {modal === 'protect' && <Modal title="Protect your editable workspace" onClose={() => setModal(null)}><p className="muted">Use a password you can keep safely. It is required to open this workspace on any computer. Paperdesk cannot recover a forgotten password.</p><form onSubmit={async event => { event.preventDefault(); if (workspaceInput !== passwordConfirm) { setError('The passwords do not match.'); return; } if (await saveWorkspace(workspaceInput)) { setWorkspaceInput(''); setPasswordConfirm(''); } }}><label className="input-label">New password<input type="password" minLength={8} required autoComplete="new-password" value={workspaceInput} onChange={event => setWorkspaceInput(event.target.value)} /></label><label className="input-label">Confirm password<input type="password" required autoComplete="new-password" value={passwordConfirm} onChange={event => setPasswordConfirm(event.target.value)} /></label><button className="primary full" type="submit">Save protected workspace</button></form></Modal>}
+    {workspaceUnlock && <Modal title="Unlock workspace" onClose={() => { workspaceUnlock.resolve(null); setWorkspaceUnlock(null); setWorkspaceInput(''); }}><form onSubmit={event => { event.preventDefault(); workspaceUnlock.resolve(workspaceInput); setWorkspaceUnlock(null); setWorkspaceInput(''); }}><p className="muted">{workspaceUnlock.message}</p><input type="password" required aria-label="Workspace password" autoComplete="current-password" value={workspaceInput} onChange={event => setWorkspaceInput(event.target.value)} /><button className="primary full" type="submit">Unlock</button></form></Modal>}
+    {modal === 'ocr-text' && <Modal title="Recognized text" onClose={() => setModal(null)}><p className="muted">OCR may contain mistakes. This text is saved in your workspace and included in searches inside Paperdesk.</p><textarea className="schema-text" aria-label="Recognized text" readOnly value={Object.entries(state.ocr || {}).map(([number, result]) => `Page ${number} (${Math.round(result.confidence)}% confidence)\n${result.text}`).join('\n\n')} onFocus={event => event.target.select()} /></Modal>}
+    {modal === 'updates' && <Modal title="Paperdesk updates" onClose={() => setModal(null)}><p>{updateInfo?.available ? `Version ${updateInfo.version} is available. You have ${updateInfo.current}.` : `You have the latest version (${updateInfo?.current}).`}</p>{updateInfo?.available && <button className="primary full" onClick={() => window.paperdesk.downloadUpdate()}>Open official download</button>}<p className="tiny muted">Updates are downloaded from the official GitHub release page. This check sends no documents or form details.</p></Modal>}
+    {modal === 'discard' && <Modal title="You have unsaved changes" onClose={() => { setModal(null); setPendingAction(null); }}><p className="muted">Use Save first if you want to keep editing the details you entered.</p><div className="modal-actions"><button className="secondary" onClick={async () => { const action = pendingAction; await clearRecovery(); setModal(null); setPendingAction(null); action?.(); }}>Discard changes</button><button className="primary" onClick={async () => { const action = pendingAction; if (await saveBeforeAction(saveWorkspace, action)) setPendingAction(null); }}>Save first</button></div></Modal>}
     {modal?.type === 'copy' && <Modal title="Copy this field list into your chat" onClose={() => setModal(null)}><textarea className="schema-text" readOnly value={modal.text} onFocus={event => event.target.select()} /><p className="tiny muted">Select all and press Ctrl+C, then paste into your chat with the details to fill.</p></Modal>}
     {passwordRequest && <Modal title="This PDF needs a password" onClose={() => { loadTask.current?.destroy(); setPasswordRequest(null); setBusy(''); }}><form onSubmit={event => { event.preventDefault(); passwordRequest.submit(password); setPasswordRequest(null); setBusy('Unlocking your PDF…'); }}><p className="muted">{passwordRequest.incorrect ? 'That password did not work. Try again.' : 'Enter the password to view this document.'}</p><input type="password" aria-label="PDF password" value={password} onChange={event => setPassword(event.target.value)} autoFocus /><button className="primary full" type="submit">Open document</button></form></Modal>}
     {error && <Modal title="That didn’t quite work" onClose={() => setError('')}><div className="error-detail"><AlertCircle size={24} /><p>{error}</p></div><button className="primary full" onClick={() => setError('')}>Got it</button></Modal>}

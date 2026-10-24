@@ -1,0 +1,26 @@
+name: Report a problem
+description: Tell us what happened in Paperdesk PDF.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "GitHub issues are public. Use a blank or synthetic document to reproduce a problem. Keep personal PDFs, workspaces, signatures, passwords and form answers out of reports."
+  - type: input
+    id: version
+    attributes:
+      label: Paperdesk version
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Windows and display settings
+      description: Windows version, display scaling, and installer or portable build.

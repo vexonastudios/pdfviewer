@@ -16,11 +16,14 @@ async function desktopHarness(argv = ['electron', root]) {
   class WindowMock {
     constructor(options) {
       this.options = options;
-      this.webContents = { mainFrame: {}, setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} } };
+      this.webContents = { mainFrame: {}, send: (...args) => { this.sent = args; }, executeJavaScript: script => script.includes('afterprint') ? new Promise(() => {}) : Promise.resolve([]), print: (options, callback) => { this.printOptions = options; callback(false, 'Print job canceled'); }, setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} } };
       this.listeners = new Map(); mainWindow = this;
     }
     on(name, handler) { this.listeners.set(name, handler); }
     loadURL(url) { this.loadedURL = url; }
+    close() { this.closed = true; }
+    isDestroyed() { return Boolean(this.destroyed); }
+    destroy() { this.destroyed = true; }
   }
   const appPaths = new Map();
   const electron = {
@@ -140,13 +143,41 @@ test('isolated review window uses its own single-instance profile', async () => 
   assert.equal(h.appPaths.get('userData'), path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF Review'));
 });
 
-test('closing with unsaved edits can be cancelled', async () => {
+test('packet batch failure leaves existing finals unchanged and removes staged files', async () => {
+  const folder = path.join(root, 'tmp/qa', `transaction-${Date.now()}`);
+  await mkdir(path.join(folder, 'Final PDFs'), { recursive: true });
+  await writeFile(path.join(folder, 'Form.pdf'), '%PDF-original');
+  const target = path.join(folder, 'Final PDFs/Form-final.pdf');
+  await writeFile(target, '%PDF-existing-final');
+  const h = await desktopHarness();
+  h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] });
+  const packet = await h.handlers.get('pdf:open-packet')(h.event);
+  const batch = h.handlers.get('pdf:packet-export-batch'), bytes = Uint8Array.from(Buffer.from('%PDF-final'));
+  await assert.rejects(() => batch(h.event, packet.review.id, [{ index: 0, bytes }, { index: 5, bytes }]), /Invalid packet/);
+  assert.equal(await readFile(target, 'utf8'), '%PDF-existing-final');
+  assert.deepEqual(await readdir(path.join(folder, 'Final PDFs')), ['Form-final.pdf']);
+  await batch(h.event, packet.review.id, [{ index: 0, bytes, copy: true }]);
+  assert.equal(await readFile(path.join(folder, 'Final PDFs/Form-copy.pdf'), 'utf8'), '%PDF-final');
+  const manifest = JSON.parse(await readFile(path.join(folder, 'Final PDFs/packet-manifest.json'), 'utf8'));
+  assert.equal(manifest.files[0].mode, 'original-copy');
+  assert.equal(manifest.files[0].sha256.length, 64);
+});
+
+test('native print cancellation resolves without reporting a sent job and validates image input', async () => {
+  const h = await desktopHarness(), print = h.handlers.get('pdf:print');
+  assert.equal(await print(h.event, [{ data: 'data:image/png;base64,iVBORw0KGgo=', width: 612, height: 792 }]), false);
+  await assert.rejects(() => print(h.event, [{ data: 'https://external.example/image.png', width: 612, height: 792 }]), /Invalid print/);
+});
+
+test('closing with unsaved edits requests Save first in the renderer before closing', async () => {
   const h = await desktopHarness();
   h.listeners.get('pdf:dirty')(h.event, true);
   let prevented = false;
   h.window.listeners.get('close')({ preventDefault: () => { prevented = true; } });
   assert.equal(prevented, true);
-  h.dialog.showMessageBoxSync = () => 1; prevented = false;
+  assert.deepEqual(h.window.sent, ['pdf:close-request']);
+  await h.handlers.get('pdf:close')(h.event);
+  assert.equal(h.window.closed, true); prevented = false;
   h.window.listeners.get('close')({ preventDefault: () => { prevented = true; } });
   assert.equal(prevented, false);
 });

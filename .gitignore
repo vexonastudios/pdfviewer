@@ -2,9 +2,14 @@ node_modules/
 dist/
 release/
 tmp/
+test-results/
+playwright-report/
 .codex-remote-attachments/
 public/pdfjs/
 public/THIRD_PARTY_NOTICES.txt
+public/ocr/
+public/app-icon.png
+public/app-icon.ico
 *.log
 *.pdf
 *.paperdesk.json

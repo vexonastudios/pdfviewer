@@ -1,6 +1,6 @@
 {
   "name": "paperdesk-pdf",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "private": true,
   "description": "A local PDF workspace for reading, filling forms, and bulk filling.",
   "author": "Paperdesk",
@@ -11,32 +11,18 @@
     "build": "node scripts/prepare-assets.mjs && vite build",
     "start": "electron .",
     "test": "node --test tests/*.test.mjs",
-    "package": "node node_modules/electron/install.js && npm run build && electron-builder --win portable --x64 --config.electronDist=node_modules/electron/dist"
-  },
-  "build": {
-    "appId": "local.paperdesk.pdf",
-    "productName": "Paperdesk PDF",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**/*",
-      "electron/**/*",
-      "package.json",
-      "!node_modules/**/*"
-    ],
-    "asar": true,
-    "win": {
-      "target": "portable",
-      "signAndEditExecutable": false
-    },
-    "portable": {
-      "artifactName": "Paperdesk-PDF-${version}.exe"
-    }
+    "package": "node node_modules/electron/install.js && npm run build && electron-builder --win nsis portable --x64 --config electron-builder.config.cjs --config.electronDist=node_modules/electron/dist",
+    "test:ui": "playwright test"
   },
   "devDependencies": {
     "@fontsource/inter": "^5.3.0",
     "@pdf-lib/fontkit": "^1.1.1",
+    "@playwright/test": "^1.64.1",
+    "@resvg/resvg-js": "^2.6.2",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "electron": "^45.0.0",
+    "electron-builder": "^26.15.3",
     "jszip": "^3.10.2",
     "lucide-react": "^1.61.0",
     "papaparse": "^5.7.0",
@@ -44,9 +30,7 @@
     "pdfjs-dist": "^6.4.299",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "@vitejs/plugin-react": "^6.1.2",
-    "electron": "^45.0.0",
-    "electron-builder": "^26.15.3",
+    "tesseract.js": "^7.0.0",
     "vite": "^8.3.5"
   }
 }

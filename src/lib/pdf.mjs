@@ -107,6 +107,12 @@ export async function writePdf(original, fields, values, additions = [], { flatt
   for (const addition of additions) {
     const page = doc.getPage(addition.page - 1);
     const color = rgb(0.10, 0.16, 0.22);
+    const lines = addition.kind === 'text' ? addition.text.replace(/\t/g, '    ').split(/\r?\n/) : [];
+    const width = addition.kind === 'signature' ? addition.width : addition.kind === 'text' ? Math.max(0, ...lines.map(line => { ensureText(line); return font.widthOfTextAtSize(line, addition.size); })) : addition.size;
+    const height = addition.kind === 'signature' ? addition.height : addition.kind === 'text' ? Math.max(addition.size, (lines.length - 1) * addition.size * 1.25 + addition.size * 1.12) : addition.size;
+    const angle = (addition.rotation || 0) * Math.PI / 180, bounds = page.getCropBox();
+    const corners = [[0, 0], [width, 0], [0, -height], [width, -height]].map(([x, y]) => [addition.x + x * Math.cos(angle) - y * Math.sin(angle), addition.y + x * Math.sin(angle) + y * Math.cos(angle)]);
+    if (corners.some(([x, y]) => x < bounds.x - 1 || y < bounds.y - 1 || x > bounds.x + bounds.width + 1 || y > bounds.y + bounds.height + 1)) throw new Error(`“${addition.label || 'Added mark'}” on page ${addition.page} extends past the page edge. Move, resize, or shorten it before export.`);
     if (addition.kind === 'text') {
       ensureText(addition.text);
       const angle = addition.rotation || 0;

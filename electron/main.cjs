@@ -2,14 +2,17 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu, protocol, net, safeSto
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'paperdesk', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }]);
 
 let window;
 let dirty = false;
-const signatureDirectory = () => path.join(app.getPath('appData'), 'Paperdesk PDF');
+let cancelPrint = null;
+const testProfile = !app.isPackaged && process.argv.includes('--paperdesk-test-profile');
+if (testProfile) { const directory = path.resolve(__dirname, '../tmp/qa/desktop-profile'); fsSync.mkdirSync(directory, { recursive: true }); app.setPath('userData', directory); }
+const signatureDirectory = () => path.join(app.getPath(testProfile ? 'userData' : 'appData'), 'Paperdesk PDF');
 const signaturePath = () => path.join(signatureDirectory(), 'signatures.enc');
 const legacySignaturePath = () => path.join(signatureDirectory(), 'signatures.json');
 async function atomicWrite(target, bytes) {
@@ -21,6 +24,7 @@ async function atomicWrite(target, bytes) {
     await fs.rename(temporary, target);
   } catch (error) { await fs.rm(temporary, { force: true }).catch(() => {}); throw error; }
 }
+const vault = require(path.join(__dirname, 'vault.cjs'))(path.join(signatureDirectory(), 'Private drafts'), safeStorage, atomicWrite);
 function validSignature(record) {
   if (!record || typeof record.signer !== 'string' || !record.signer.trim() || record.signer.length > 80 || /[\x00-\x1f]/.test(record.signer) || typeof record.dataUrl !== 'string' ||
       !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(record.dataUrl) || record.dataUrl.length > 2_000_000 ||
@@ -67,7 +71,7 @@ if (process.argv.includes('--paperdesk-isolated-review')) {
   fsSync.mkdirSync(reviewProfile, { recursive: true });
   app.setPath('userData', reviewProfile);
 }
-const lock = app.requestSingleInstanceLock();
+const lock = testProfile || app.requestSingleInstanceLock();
 if (!lock) app.quit();
 
 function validSender(event) {
@@ -111,12 +115,12 @@ async function packetPaths(root) {
     .sort((a, b) => path.relative(root, a).localeCompare(path.relative(root, b), undefined, { numeric: true }));
 }
 
-function packetFinalPath(session, index) {
+function packetFinalPath(session, index, copy = false) {
   const source = session.paths[index];
   const within = session.root && !path.relative(session.root, source).startsWith('..') && !path.isAbsolute(path.relative(session.root, source));
   const relative = within ? path.relative(session.root, source) : path.basename(source);
   const name = relative.replace(/(?:\.paperdesk\.json|\.pdf)$/i, '').replace(/[\\/]/g, ' - ').replace(/[<>:"|?*\x00-\x1f]/g, '_');
-  return path.join(session.root || path.dirname(source), 'Final PDFs', `${name}-final.pdf`);
+  return path.join(session.root || path.dirname(source), 'Final PDFs', `${name}-${copy ? 'copy' : 'final'}.pdf`);
 }
 
 app.on('second-instance', (_, args) => {
@@ -140,7 +144,7 @@ app.whenReady().then(() => {
   });
   Menu.setApplicationMenu(null);
   window = new BrowserWindow({
-    width: 1480, height: 980, minWidth: 1000, minHeight: 700,
+    width: 1480, height: 980, minWidth: 760, minHeight: 560, icon: path.join(assetRoot, 'app-icon.png'),
     title: 'Paperdesk PDF', backgroundColor: '#f8f7f3',
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, spellcheck: false },
   });
@@ -148,12 +152,14 @@ app.whenReady().then(() => {
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.session.setPermissionRequestHandler((_, __, callback) => callback(false));
   window.on('close', event => {
-    if (dirty && dialog.showMessageBoxSync(window, { type: 'question', buttons: ['Keep editing', 'Discard and close'], defaultId: 0, cancelId: 0, message: 'Close without saving your changes?', detail: 'Your original PDF has not been changed.' }) !== 1) event.preventDefault();
+    if (dirty) { event.preventDefault(); window.webContents.send('pdf:close-request'); }
   });
+  window.on('closed', () => { cancelPrint?.(); app.quit(); });
   if (!app.isPackaged && process.env.PAPERDESK_DEV_URL === 'http://127.0.0.1:5173') window.loadURL(process.env.PAPERDESK_DEV_URL);
   else window.loadURL('paperdesk://app/index.html');
 });
 app.on('window-all-closed', () => app.quit());
+ipcMain.handle('pdf:close', event => { validSender(event); dirty = false; window.close(); });
 
 ipcMain.handle('pdf:open', async event => {
   validSender(event);
@@ -218,18 +224,20 @@ ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sou
   if (overwritePath) {
     const target = path.resolve(overwritePath);
     if (kind !== 'json' || !/\.paperdesk\.json$/i.test(target) || !openedPaths.has(target)) throw new Error('This workspace is not open for saving. Use Save As instead.');
+    await vault.backup(target);
     await atomicWrite(target, bytes);
     return { name: path.basename(target), path: target };
   }
   let defaultPath = safeName;
   if (kind === 'json' && sourcePath && openedPaths.has(path.resolve(sourcePath))) defaultPath = path.join(path.dirname(path.resolve(sourcePath)), safeName);
-  if (kind === 'final-pdf' && sourcePath && openedPaths.has(path.resolve(sourcePath))) {
+  if (['final-pdf', 'copy-pdf'].includes(kind) && sourcePath && openedPaths.has(path.resolve(sourcePath))) {
     const exportDirectory = path.join(path.dirname(path.resolve(sourcePath)), 'Final PDFs');
     await fs.mkdir(exportDirectory, { recursive: true });
     defaultPath = path.join(exportDirectory, safeName);
   }
   const result = await dialog.showSaveDialog(window, { title: kind === 'final-pdf' ? 'Export final PDF' : kind === 'json' ? 'Save workspace' : 'Save a copy', defaultPath, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
   if (result.canceled) return null;
+  if (kind === 'json') await vault.backup(result.filePath);
   await atomicWrite(result.filePath, bytes);
   if (kind === 'json' && /\.paperdesk\.json$/i.test(result.filePath)) openedPaths.add(path.resolve(result.filePath));
   return { name: path.basename(result.filePath), path: result.filePath };
@@ -269,4 +277,91 @@ ipcMain.handle('pdf:show-output', async (event, filePath) => {
   validSender(event);
   // Only reveal a location; never execute the file.
   shell.showItemInFolder(String(filePath));
+});
+
+ipcMain.handle('pdf:recovery-save', async (event, record) => {
+  validSender(event);
+  if (!record || typeof record.name !== 'string' || typeof record.documentId !== 'string' || typeof record.bytes !== 'string' || record.bytes.length > 700 * 1024 * 1024 || record.sourcePath && !openedPaths.has(path.resolve(record.sourcePath))) throw new Error('Invalid recovery draft.');
+  return vault.snapshot(record);
+});
+ipcMain.handle('pdf:recovery-clear', async (event, source) => { validSender(event); if (typeof source !== 'string') throw new Error('Invalid draft.'); return vault.clear(source); });
+ipcMain.handle('pdf:recovery-list', async (event, kind = 'recovery') => { validSender(event); if (!['recovery', 'history'].includes(kind)) throw new Error('Invalid history.'); return vault.list(kind); });
+ipcMain.handle('pdf:recovery-read', async (event, kind, id) => {
+  validSender(event);
+  const record = await vault.restore(kind, id);
+  if (record.sourcePath) openedPaths.add(path.resolve(record.sourcePath));
+  return { ...record, bytes: new Uint8Array(Buffer.from(record.bytes, 'base64')), name: record.name.endsWith('.paperdesk.json') ? record.name : record.name.replace(/\.pdf$/i, '') + '.paperdesk.json' };
+});
+ipcMain.handle('pdf:recovery-remove', async (event, kind, id) => { validSender(event); return vault.remove(kind, id); });
+ipcMain.handle('pdf:merge-open', async event => {
+  validSender(event);
+  const result = await dialog.showOpenDialog(window, { title: 'Choose PDFs to append', filters: [{ name: 'PDF', extensions: ['pdf'] }], properties: ['openFile', 'multiSelections'] });
+  if (result.canceled) return [];
+  if (result.filePaths.length > 50) throw new Error('Append no more than 50 PDFs at a time.');
+  return Promise.all(result.filePaths.map(readPDF));
+});
+ipcMain.handle('pdf:check-updates', async event => {
+  validSender(event);
+  const response = await net.fetch('https://api.github.com/repos/vexonastudios/pdfviewer/releases/latest', { headers: { Accept: 'application/vnd.github+json' } });
+  if (!response.ok) throw new Error('The update service is unavailable. Try again later.');
+  const release = await response.json(), version = String(release.tag_name || '').replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Unrecognized release version.');
+  const current = app.getVersion();
+  const newer = version.split('.').map(Number).some((part, index, parts) => part > Number(current.split('.')[index]) && parts.slice(0, index).every((value, i) => value === Number(current.split('.')[i])));
+  return { current, version, available: newer };
+});
+ipcMain.handle('pdf:download-update', async event => { validSender(event); await shell.openExternal('https://github.com/vexonastudios/pdfviewer/releases/latest'); });
+ipcMain.handle('pdf:print', async (event, images) => {
+  validSender(event);
+  if (cancelPrint) throw new Error('Close the current print session before starting another.');
+  if (!Array.isArray(images) || !images.length || images.length > 300 || images.reduce((sum, image) => sum + String(image.data).length, 0) > 400 * 1024 * 1024 || images.some(image => !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image.data) || !Number.isFinite(image.width) || !Number.isFinite(image.height) || image.width < 1 || image.height < 1)) throw new Error('Invalid print pages.');
+  const printer = new BrowserWindow({ show: false, parent: window, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+  let canceled = false;
+  cancelPrint = () => { canceled = true; };
+  try {
+    const html = `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'"><style>body{margin:0}section{break-after:page}section:last-child{break-after:auto}img{width:100%;height:100%;object-fit:contain;display:block}${images.map((image, index) => `@page sheet${index}{margin:0;size:${image.width}pt ${image.height}pt}.sheet${index}{page:sheet${index};width:${image.width}pt;height:${image.height}pt}`).join('')}</style>${images.map((image, index) => `<section class="sheet${index}"><img src="${image.data}"></section>`).join('')}`;
+    await printer.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    await printer.webContents.executeJavaScript('Promise.all([...document.images].map(image => image.decode()))');
+    if (canceled) return false;
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (success, error) => { if (settled) return; settled = true; cancelPrint = null; error ? reject(error) : resolve(success); };
+      cancelPrint = () => finish(false);
+      printer.webContents.executeJavaScript('new Promise(resolve => window.addEventListener("afterprint", () => resolve(false), { once: true }))').then(() => finish(false), () => finish(false));
+      printer.webContents.print({ silent: false, printBackground: true, margins: { marginType: 'none' } }, (success, reason) => finish(success, !success && !/cancel/i.test(reason) ? new Error(reason || 'Printing failed.') : null));
+    });
+  } finally { cancelPrint = null; if (!printer.isDestroyed()) printer.destroy(); }
+});
+ipcMain.handle('pdf:print-cancel', event => { validSender(event); cancelPrint?.(); });
+ipcMain.handle('pdf:packet-export-batch', async (event, id, entries) => {
+  validSender(event);
+  const session = reviewSessions.get(id);
+  if (!session?.root || !Array.isArray(entries) || !entries.length || entries.length > 200) throw new Error('Reopen the packet before exporting.');
+  const staged = [], targets = new Set();
+  let total = 0;
+  try {
+    for (const entry of entries) {
+      if (!Number.isInteger(entry.index) || entry.index < 0 || entry.index >= session.paths.length || !(entry.bytes instanceof Uint8Array) || Buffer.from(entry.bytes.subarray(0, 5)).toString() !== '%PDF-' || (total += entry.bytes.length) > 500 * 1024 * 1024) throw new Error('Invalid packet output or packet exceeds 500 MB.');
+      const target = packetFinalPath(session, entry.index, Boolean(entry.copy));
+      if (targets.has(target.toLowerCase())) throw new Error('Two packet documents have the same final filename. Rename one before exporting.');
+      targets.add(target.toLowerCase());
+      const temporary = target + '.' + randomUUID() + '.stage';
+      await atomicWrite(temporary, entry.bytes);
+      staged.push({ target, temporary, hash: createHash('sha256').update(entry.bytes).digest('hex'), copy: Boolean(entry.copy) });
+    }
+    for (const item of staged) {
+      if (await fs.stat(item.target).catch(() => null)) { item.backup = item.target + '.' + randomUUID() + '.previous'; await fs.rename(item.target, item.backup); }
+      await fs.rename(item.temporary, item.target); item.committed = true;
+    }
+    await atomicWrite(path.join(session.root, 'Final PDFs', 'packet-manifest.json'), JSON.stringify({ exportedAt: new Date().toISOString(), files: staged.map(item => ({ name: path.basename(item.target), mode: item.copy ? 'original-copy' : 'flattened', sha256: item.hash })) }, null, 2));
+  } catch (error) {
+    for (const item of staged.toReversed()) {
+      if (item.committed) await fs.rm(item.target, { force: true });
+      if (item.backup) await fs.rename(item.backup, item.target);
+      await fs.rm(item.temporary, { force: true });
+    }
+    throw error;
+  }
+  for (const item of staged) if (item.backup) await fs.rm(item.backup, { force: true });
+  return { count: staged.length, path: path.join(session.root, 'Final PDFs', 'packet-manifest.json') };
 });
