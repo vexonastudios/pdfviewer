@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell, Menu, protocol, net } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell, Menu, protocol, net, safeStorage } = require('electron');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
@@ -9,7 +9,18 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'paperdesk', privileges: { stand
 
 let window;
 let dirty = false;
-const signaturePath = () => path.join(app.getPath('appData'), 'Paperdesk PDF', 'signatures.json');
+const signatureDirectory = () => path.join(app.getPath('appData'), 'Paperdesk PDF');
+const signaturePath = () => path.join(signatureDirectory(), 'signatures.enc');
+const legacySignaturePath = () => path.join(signatureDirectory(), 'signatures.json');
+async function atomicWrite(target, bytes) {
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.tmp`);
+  try {
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    await fs.rename(temporary, target);
+  } catch (error) { await fs.rm(temporary, { force: true }).catch(() => {}); throw error; }
+}
 function validSignature(record) {
   if (!record || typeof record.signer !== 'string' || !record.signer.trim() || record.signer.length > 80 || /[\x00-\x1f]/.test(record.signer) || typeof record.dataUrl !== 'string' ||
       !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(record.dataUrl) || record.dataUrl.length > 2_000_000 ||
@@ -24,14 +35,26 @@ function validSignature(record) {
 }
 async function readSignatures() {
   try {
-    const records = JSON.parse(await fs.readFile(signaturePath(), 'utf8'));
+    const encrypted = await fs.readFile(signaturePath());
+    if (!safeStorage?.isEncryptionAvailable()) throw new Error('Windows signature encryption is unavailable on this computer.');
+    if (encrypted.subarray(0, 5).toString() !== 'PDSG1') throw new Error('The saved signature library is not recognized.');
+    const records = JSON.parse(safeStorage.decryptString(encrypted.subarray(5)));
     return Array.isArray(records) ? records.map(validSignature).slice(0, 20) : [];
-  } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try {
+      const records = JSON.parse(await fs.readFile(legacySignaturePath(), 'utf8'));
+      const safe = Array.isArray(records) ? records.map(validSignature).slice(0, 20) : [];
+      await writeSignatures(safe);
+      await fs.rm(legacySignaturePath());
+      return safe;
+    } catch (legacyError) { if (legacyError.code === 'ENOENT') return []; throw legacyError; }
+  }
 }
 async function writeSignatures(records) {
-  const target = signaturePath();
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, JSON.stringify(records), { mode: 0o600 });
+  if (!safeStorage?.isEncryptionAvailable()) throw new Error('Windows signature encryption is unavailable on this computer.');
+  const encrypted = Buffer.concat([Buffer.from('PDSG1'), safeStorage.encryptString(JSON.stringify(records))]);
+  await atomicWrite(signaturePath(), encrypted);
 }
 const fileArguments = args => args.slice(1).filter(arg => /(?:\.pdf|\.paperdesk\.json)$/i.test(arg));
 let pendingPaths = fileArguments(process.argv);
@@ -65,8 +88,35 @@ async function prepareOpen(paths) {
   const file = await readPDF(paths[0]);
   if (paths.length === 1) return { file, review: null };
   const id = randomUUID();
-  reviewSessions.set(id, paths);
+  reviewSessions.set(id, { paths, root: null });
   return { file, review: { id, items: paths.map(filePath => ({ name: path.basename(filePath) })) } };
+}
+
+async function packetPaths(root) {
+  const found = [];
+  async function visit(directory, depth) {
+    if (depth > 4) return;
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || ['Final PDFs', 'node_modules', 'release'].includes(entry.name)) continue;
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(target, depth + 1);
+      else if (entry.isFile() && /(?:\.pdf|\.paperdesk\.json)$/i.test(entry.name)) found.push(target);
+      if (found.length > 200) throw new Error('This folder has more than 200 PDFs and workspaces. Choose a smaller packet folder.');
+    }
+  }
+  await visit(root, 0);
+  const workspaces = new Set(found.filter(file => /\.paperdesk\.json$/i.test(file)).map(file => file.replace(/\.paperdesk\.json$/i, '').toLowerCase()));
+  return found.filter(file => !/\.pdf$/i.test(file) || !workspaces.has(file.replace(/\.pdf$/i, '').toLowerCase()))
+    .sort((a, b) => path.relative(root, a).localeCompare(path.relative(root, b), undefined, { numeric: true }));
+}
+
+function packetFinalPath(session, index) {
+  const source = session.paths[index];
+  const within = session.root && !path.relative(session.root, source).startsWith('..') && !path.isAbsolute(path.relative(session.root, source));
+  const relative = within ? path.relative(session.root, source) : path.basename(source);
+  const name = relative.replace(/(?:\.paperdesk\.json|\.pdf)$/i, '').replace(/[\\/]/g, ' - ').replace(/[<>:"|?*\x00-\x1f]/g, '_');
+  return path.join(session.root || path.dirname(source), 'Final PDFs', `${name}-final.pdf`);
 }
 
 app.on('second-instance', (_, args) => {
@@ -110,6 +160,25 @@ ipcMain.handle('pdf:open', async event => {
   const result = await dialog.showOpenDialog(window, { title: 'Open a PDF or workspace', filters: [{ name: 'PDF or Paperdesk workspace', extensions: ['pdf', 'json'] }], properties: ['openFile'] });
   return result.canceled ? null : readPDF(result.filePaths[0]);
 });
+ipcMain.handle('pdf:open-packet', async event => {
+  validSender(event);
+  const result = await dialog.showOpenDialog(window, { title: 'Open a folder of PDFs and workspaces', properties: ['openDirectory'] });
+  if (result.canceled) return null;
+  const root = path.resolve(result.filePaths[0]);
+  const paths = await packetPaths(root);
+  if (!paths.length) throw new Error('This folder has no PDFs or Paperdesk workspaces.');
+  const file = await readPDF(paths[0]);
+  const id = randomUUID();
+  const session = { paths, root };
+  reviewSessions.set(id, session);
+  const items = await Promise.all(paths.map(async (filePath, index) => {
+    const final = packetFinalPath(session, index);
+    const source = await fs.stat(filePath);
+    const exported = await fs.stat(final).then(info => info.mtimeMs >= source.mtimeMs).catch(() => false);
+    return { name: path.basename(filePath), location: path.relative(root, filePath), exported };
+  }));
+  return { file, review: { id, root, items } };
+});
 ipcMain.handle('pdf:initial', async event => {
   validSender(event);
   if (!pendingPaths.length) return null;
@@ -119,9 +188,27 @@ ipcMain.handle('pdf:initial', async event => {
 });
 ipcMain.handle('pdf:review-file', async (event, id, index) => {
   validSender(event);
-  const paths = reviewSessions.get(id);
-  if (!paths || !Number.isInteger(index) || index < 0 || index >= paths.length) throw new Error('This review item is unavailable. Reopen the review queue.');
-  return readPDF(paths[index]);
+  const session = reviewSessions.get(id);
+  if (!session || !Number.isInteger(index) || index < 0 || index >= session.paths.length) throw new Error('This review item is unavailable. Reopen the review queue.');
+  return readPDF(session.paths[index]);
+});
+ipcMain.handle('pdf:packet-update', async (event, id, index, filePath) => {
+  validSender(event);
+  const session = reviewSessions.get(id);
+  const resolved = path.resolve(String(filePath));
+  if (!session?.root || !Number.isInteger(index) || index < 0 || index >= session.paths.length ||
+      !/\.paperdesk\.json$/i.test(resolved) || !openedPaths.has(resolved)) throw new Error('This saved workspace cannot replace a packet item.');
+  session.paths[index] = resolved;
+  return { name: path.basename(resolved), location: path.relative(session.root, resolved), exported: false };
+});
+ipcMain.handle('pdf:packet-export', async (event, id, index, bytes) => {
+  validSender(event);
+  const session = reviewSessions.get(id);
+  if (!session?.root || !Number.isInteger(index) || index < 0 || index >= session.paths.length) throw new Error('Reopen the packet folder before exporting.');
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength > 500 * 1024 * 1024) throw new Error('Invalid final PDF.');
+  const target = packetFinalPath(session, index);
+  await atomicWrite(target, bytes);
+  return { name: path.basename(target), path: target };
 });
 ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sourcePath }) => {
   validSender(event);
@@ -131,10 +218,11 @@ ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sou
   if (overwritePath) {
     const target = path.resolve(overwritePath);
     if (kind !== 'json' || !/\.paperdesk\.json$/i.test(target) || !openedPaths.has(target)) throw new Error('This workspace is not open for saving. Use Save As instead.');
-    await fs.writeFile(target, bytes);
+    await atomicWrite(target, bytes);
     return { name: path.basename(target), path: target };
   }
   let defaultPath = safeName;
+  if (kind === 'json' && sourcePath && openedPaths.has(path.resolve(sourcePath))) defaultPath = path.join(path.dirname(path.resolve(sourcePath)), safeName);
   if (kind === 'final-pdf' && sourcePath && openedPaths.has(path.resolve(sourcePath))) {
     const exportDirectory = path.join(path.dirname(path.resolve(sourcePath)), 'Final PDFs');
     await fs.mkdir(exportDirectory, { recursive: true });
@@ -142,7 +230,7 @@ ipcMain.handle('pdf:save', async (event, { bytes, name, kind, overwritePath, sou
   }
   const result = await dialog.showSaveDialog(window, { title: kind === 'final-pdf' ? 'Export final PDF' : kind === 'json' ? 'Save workspace' : 'Save a copy', defaultPath, filters: [{ name: extension.toUpperCase(), extensions: [extension] }] });
   if (result.canceled) return null;
-  await fs.writeFile(result.filePath, bytes);
+  await atomicWrite(result.filePath, bytes);
   if (kind === 'json' && /\.paperdesk\.json$/i.test(result.filePath)) openedPaths.add(path.resolve(result.filePath));
   return { name: path.basename(result.filePath), path: result.filePath };
 });

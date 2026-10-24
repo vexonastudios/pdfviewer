@@ -8,7 +8,7 @@ Download the portable Windows executable from [GitHub Releases](https://github.c
 
 Releases contain only the application code and bundled open-source assets. Your PDFs, editable workspaces, pasted data, saved signatures, and initials remain on your computer and are excluded from this source repository and release builds.
 
-Version 1.0.4 includes separate locally saved initials, HSEGH caregiver initials targets, and printed-name placement beside flat-form signatures. Existing workspaces remain compatible.
+Version 1.0.5 adds packet-folder review and export, safer saves, protected local signature storage, and checks that stop clipped answers from being exported. Existing workspaces remain compatible.
 
 ## Everyday use
 
@@ -17,9 +17,11 @@ Version 1.0.4 includes separate locally saved initials, HSEGH caregiver initials
 3. To sign a fillable signature box, click **Sign here** and choose the saved signer. Paperdesk places the signature, the printed name when requested, and the signing date. The **Today** button also fills a signing date on its own. To create a saved signature, click **Sign**, then draw it or choose **Import a photo**. Each person should review the form and place their own signature.
 4. To initial a HSEGH report, click **Initial** and have each caregiver draw or import their own initials. Click **Initial** above a caregiver blank at the bottom of a page. Choose **Initial here** for that page, or **All pages** after reviewing the complete report. The form's last page has separate parent signature lines.
 5. Click **Save** (or Ctrl+S) while working. An opened `.paperdesk.json` workspace saves back to that same file; the first Save from a PDF asks where to create a workspace. This draft retains the original PDF, field values, and movable additions. Workspace files contain your document and entered information, including placed signature images; store them like the original PDF.
-6. When the form is final, click **Export final PDF**, then **Export flattened PDF**. The Save dialog starts in a **Final PDFs** folder beside the draft, with a `-final.pdf` filename. This makes one share-ready PDF per form. Flattening removes interactive form fields, but does not make a PDF tamper-proof against deliberate editing with PDF software.
+6. When the form is final, click **Export final PDF**, then **Export flattened PDF**. The Save dialog starts in a **Final PDFs** folder beside the draft, with a `-final.pdf` filename. This makes one share-ready PDF per form. Flattening removes interactive form fields, but does not make a PDF tamper-proof against deliberate editing with PDF software. If an answer cannot fit readably in its field, export stops and names the field to shorten.
 
-Saved signatures and initials are kept separately in `%APPDATA%\Paperdesk PDF\signatures.json` on this computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. These ink images are visual marks, not certificate-backed digital signatures.
+For a group of forms, click **Open packet** and select their folder. Paperdesk lists PDFs and saved workspaces in that folder and its subfolders, preferring an editable workspace when it sits beside its source PDF. Review each document, Save any changes, then click **Mark reviewed**. The queue shows obvious blank required fields, signing dates, signature lines, and caregiver initials as prompts; it cannot decide which agency-only sections apply to you. **Export reviewed finals** writes the marked forms to one **Final PDFs** folder in the selected packet folder with distinct names. Opening the folder again shows finals that are newer than their workspaces.
+
+Saved signatures and initials are protected with Windows user encryption in `%APPDATA%\Paperdesk PDF\signatures.enc`. Paperdesk migrates an existing `signatures.json` library on first use and removes the old plaintext file after a successful migration. The encrypted library is tied to your Windows account; keep your original signed PDFs or a separate backup if you move to another computer. Imported photos are cleaned in memory; Paperdesk stores only the cropped transparent PNG. These ink images are visual marks, not certificate-backed digital signatures. Editable `.paperdesk.json` workspaces still contain your PDF, answers, and placed marks in ordinary JSON, so store them like other sensitive documents.
 
 When you resize a placed saved signature, Paperdesk remembers that width for that signer’s next placement. A smaller signature box still limits the size so the ink fits. This preference stays on this computer with the saved signature.
 
@@ -34,7 +36,7 @@ The app does not save silently. It warns before replacing a document with unsave
 
 This is a copy/paste workflow with the chat. The app has no built-in model, model connection, or automatic access to your chats. Anything you paste into a chat is shared with that chat service.
 
-Bulk fill also accepts `Field: value` lines and CSV/tab-separated tables with headers. Quoted CSV values, multiline CSV cells, and leading zeros are preserved. Checkboxes accept true/false or yes/no. Choice values must match an allowed option. Multiple records produce a ZIP containing one PDF per record (up to 200 records / 300 MB per batch). Unmapped fields retain their current values.
+Bulk fill also accepts `Field: value` lines and CSV/tab-separated tables with headers. Quoted CSV values, multiline CSV cells, and leading zeros are preserved. Checkboxes accept true/false or yes/no. Choice values must match an allowed option. Multiple records produce a ZIP containing one PDF per record (up to 200 records / 300 MB per batch). **Flatten batch PDFs for sharing** is selected by default; clear it if recipients need editable form fields. Unmapped fields retain their current values.
 
 For a flat form, place text boxes first, give them unique field names, and save a workspace to reuse the layout. They can then be mapped in Bulk fill, just like existing PDF fields.
 
@@ -57,7 +59,7 @@ Rotation changes the viewing orientation, not the original page rotation. Text p
 - Standard AcroForm text, checkbox, radio, dropdown, and list fields are supported. Encrypted PDFs, XFA forms, and documents with existing digital signatures are view-only. PDF scripts and calculations are not executed.
 - Text and ink can be placed over scanned pages. OCR is not included. Paperdesk detects some flat signature lines and the caregiver initials footer on Form K-908-2649; other unrecognized lines can be filled with the toolbar tools.
 - No existing-page text editing, page reordering, redaction, certificate signing, or built-in printing in this first version.
-- The bundled Noto Sans font supports many alphabets, but not all scripts or emoji. Export reports unsupported characters instead of silently substituting them. Review long values for fit.
+- The bundled Noto Sans font supports many alphabets, but not all scripts or emoji. Export reports unsupported characters instead of silently substituting them. Long answers shrink only to a readable size; if they still cannot fit, export asks you to shorten them.
 - Added text, checkmarks, and signatures are permanent in exported PDFs. Retain a workspace for future editing.
 - Individual files are limited to 300 MB. Complex PDFs may take longer to render.
 

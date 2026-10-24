@@ -50,7 +50,7 @@ Object.assign(values, {
   'Date Form Requested': '10/21/2026',
   'Two lines': 'Jamie Parker\n15 Oak Avenue',
   'Wrapped and right aligned': 'This longer answer wraps onto multiple lines while keeping the original right alignment.',
-  Overflow: 'First visible line\nSecond line\nThird line\nFourth line\nFifth line',
+  Overflow: 'First line\nSecond line',
 });
 
 test('centers dates in tall multiline fields, including existing values, without changing form semantics', async () => {
@@ -73,7 +73,7 @@ test('centers dates in tall multiline fields, including existing values, without
   await writeFile(new URL('alignment.paperdesk.json', qa), JSON.stringify({ format: 'paperdesk-workspace-v1', name: 'Alignment check.pdf', pdf: Buffer.from(original).toString('base64'), state: { values, additions: [] } }));
 });
 
-test('centers multiline blocks, preserves wrapping and horizontal alignment, and anchors overflow at the top', async () => {
+test('centers multiline blocks, preserves wrapping and horizontal alignment', async () => {
   const form = (await PDFDocument.load(await writePdf(original, fields, values, [], { fontBytes }))).getForm();
   const two = positions(appearance(form.getTextField('Two lines')));
   assert.equal(two.length, 2);
@@ -85,9 +85,13 @@ test('centers multiline blocks, preserves wrapping and horizontal alignment, and
   assert.ok(wrapLines.length > 1);
   assert.ok(wrapLines.some(line => line.x > 10));
   const overflow = positions(appearance(form.getTextField('Overflow')));
-  assert.equal(overflow.length, 5);
-  assert.ok(overflow[0].y > 15 && overflow[0].y < 20, 'The first line remains inside the field');
-  assert.ok(overflow.at(-1).y < 0, 'Overflow continues below, without moving the first line');
+  assert.equal(overflow.length, 2);
+  assert.ok(overflow.every(line => line.y > 0), 'Both lines remain inside the field');
+});
+
+test('refuses a flattened final when multiline text cannot fit readably', async () => {
+  const tooLong = { ...values, Overflow: 'This text begins here. '.repeat(20) };
+  await assert.rejects(() => writePdf(original, fields, tooLong, [], { fontBytes, flatten: true }), /Overflow.*too long for a readable fit/);
 });
 
 test('centering honors widget rotation and works without a custom font', async () => {

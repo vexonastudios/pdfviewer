@@ -4,6 +4,8 @@ import { Check } from 'lucide-react';
 import { fitFontSize, formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
 import { findFlatSignatureTargets } from './lib/signature-targets.mjs';
 import { findFlatInitialTargets } from './lib/initial-targets.mjs';
+import { findTextMatch } from './lib/search.mjs';
+import { pairSignatureDates } from './lib/signature-dates.mjs';
 
 function FittingTextInput({ value, style, ...props }) {
   const ref = useRef(null);
@@ -122,7 +124,10 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
     return () => { disposed = true; task?.cancel(); textLayer?.cancel(); };
   }, [pdf, number, zoom, rotation, hostWidth, readOnly]);
   useEffect(() => {
-    for (const span of textRef.current.querySelectorAll('span')) span.classList.toggle('search-hit', Boolean(query && span.textContent.toLowerCase().includes(query.toLowerCase())));
+    const spans = [...textRef.current.querySelectorAll('span')];
+    const hit = findTextMatch(spans.map(span => ({ text: span.textContent })), query);
+    const indexes = new Set(hit?.partIndexes || []);
+    spans.forEach((span, index) => span.classList.toggle('search-hit', indexes.has(index)));
   }, [ready, query]);
   function coordinates(event) {
     const bounds = paperRef.current.getBoundingClientRect();
@@ -160,21 +165,20 @@ export default function PdfPage({ pdf, number, zoom, rotation, fields, values, a
     if (moved) onMove(item.id, { x: item.x + endX - x, y: item.y + endY - y });
     drag.current = null;
   }
+  const visibleWidgets = ready?.annotations.filter(annotation => annotation.subtype === 'Widget' && !annotation.hidden && !annotation.noView) || [];
+  const signatureDates = pairSignatureDates(visibleWidgets, fields);
   return <div className="page-scroll" ref={hostRef}>
     <div className="page-stage"><div ref={paperRef} className={`pdf-paper tool-${tool} ${highlight ? 'highlight-fields' : ''}`} onClick={clickPage} aria-label={`PDF page ${number}`}>
       <canvas ref={canvasRef} />
       <div ref={textRef} className="textLayer" />
-      {ready && !readOnly && ready.annotations.filter(annotation => annotation.subtype === 'Widget' && !annotation.hidden && !annotation.noView).map(annotation => {
+      {ready && !readOnly && visibleWidgets.map(annotation => {
         const field = fields.find(field => field.name === annotation.fieldName);
         if (!field || ['button', 'unsupported'].includes(field.type)) return null;
         const rect = [...ready.viewport.convertToViewportPoint(annotation.rect[0], annotation.rect[1]), ...ready.viewport.convertToViewportPoint(annotation.rect[2], annotation.rect[3])];
         const left = Math.min(rect[0], rect[2]), top = Math.min(rect[1], rect[3]), width = Math.abs(rect[2] - rect[0]), height = Math.abs(rect[3] - rect[1]);
         if (field.type === 'signature') {
           const signed = additions.some(item => item.kind === 'signature' && item.targetField === field.name && item.page === number);
-          const center = (annotation.rect[1] + annotation.rect[3]) / 2;
-          const closestDate = ready.annotations.filter(item => isDateSignedField(fields.find(candidate => candidate.name === item.fieldName)))
-            .sort((a, b) => Math.abs((a.rect[1] + a.rect[3]) / 2 - center) - Math.abs((b.rect[1] + b.rect[3]) / 2 - center))[0];
-          return <div key={annotation.id} className={`pdf-sign-target ${signed ? 'is-filled' : ''}`} style={{ left, top, width, height }}><button type="button" onClick={event => { event.stopPropagation(); onSignField({ fieldName: field.name, page: number, rect: annotation.rect, dateFieldName: closestDate?.fieldName }); }}>{signed ? 'Change' : 'Sign here'}</button></div>;
+          return <div key={annotation.id} className={`pdf-sign-target ${signed ? 'is-filled' : ''}`} style={{ left, top, width, height }}><button type="button" onClick={event => { event.stopPropagation(); onSignField({ fieldName: field.name, page: number, rect: annotation.rect, dateFieldName: signatureDates.get(annotation.id) }); }}>{signed ? 'Change' : 'Sign here'}</button></div>;
         }
         const option = field.radioValues?.[annotation.buttonValue] ?? annotation.buttonValue;
         const dateSigned = isDateSignedField(field);

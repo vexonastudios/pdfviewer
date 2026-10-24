@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,7 @@ async function desktopHarness(argv = ['electron', root]) {
     Menu: { setApplicationMenu() {} }, shell: { showItemInFolder() {} },
     protocol: { registerSchemesAsPrivileged() {}, handle: (name, handler) => protocols.set(name, handler) },
     net: { fetch: async url => new Response(url) },
+    safeStorage: { isEncryptionAvailable: () => true, encryptString: value => Buffer.from(value, 'utf8').map(byte => byte ^ 0xaa), decryptString: value => Buffer.from(value).map(byte => byte ^ 0xaa).toString('utf8') },
   };
   const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Buffer, Uint8Array, Response, URL });
   vm.runInContext(await readFile(path.join(root, 'electron/main.cjs'), 'utf8'), context);
@@ -107,6 +108,33 @@ test('desktop review queue preserves argument order and opens each file on deman
   await assert.rejects(() => h.handlers.get('pdf:review-file')({ sender: {} }, initial.review.id, 0), /Unknown caller/);
 });
 
+test('packet folder prefers editable workspaces and exports reviewed finals atomically', async () => {
+  const folder = path.join(root, 'tmp/qa', `packet-${Date.now()}`);
+  await mkdir(path.join(folder, 'Child'), { recursive: true });
+  await mkdir(path.join(folder, 'Final PDFs'), { recursive: true });
+  await writeFile(path.join(folder, 'Child', 'Form.pdf'), '%PDF-original');
+  await writeFile(path.join(folder, 'Child', 'Form.paperdesk.json'), '{"format":"paperdesk-workspace-v1"}');
+  await writeFile(path.join(folder, 'Other.pdf'), '%PDF-other');
+  await writeFile(path.join(folder, 'Final PDFs', 'old.pdf'), '%PDF-old');
+  const h = await desktopHarness();
+  h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] });
+  const packet = await h.handlers.get('pdf:open-packet')(h.event);
+  assert.deepEqual(Array.from(packet.review.items, item => item.location), ['Child\\Form.paperdesk.json', 'Other.pdf']);
+  const final = Uint8Array.from(Buffer.from('%PDF-final'));
+  const result = await h.handlers.get('pdf:packet-export')(h.event, packet.review.id, 0, final);
+  assert.equal(result.path, path.join(folder, 'Final PDFs', 'Child - Form-final.pdf'));
+  assert.deepEqual(new Uint8Array(await readFile(result.path)), final);
+  assert.equal((await readdir(path.join(folder, 'Final PDFs'))).some(name => name.endsWith('.tmp')), false);
+  await h.handlers.get('pdf:review-file')(h.event, packet.review.id, 1);
+  const newWorkspace = path.join(folder, 'Other.paperdesk.json');
+  h.dialog.showSaveDialog = async () => ({ canceled: false, filePath: newWorkspace });
+  await h.handlers.get('pdf:save')(h.event, { bytes: Uint8Array.from(Buffer.from('{"format":"paperdesk-workspace-v1"}')), name: 'Other.paperdesk.json', kind: 'json', sourcePath: path.join(folder, 'Other.pdf') });
+  const updated = await h.handlers.get('pdf:packet-update')(h.event, packet.review.id, 1, newWorkspace);
+  assert.equal(updated.name, 'Other.paperdesk.json');
+  assert.equal((await h.handlers.get('pdf:review-file')(h.event, packet.review.id, 1)).name, 'Other.paperdesk.json');
+  await assert.rejects(() => h.handlers.get('pdf:packet-export')(h.event, 'unknown', 0, final), /Reopen the packet folder/);
+});
+
 test('isolated review window uses its own single-instance profile', async () => {
   const h = await desktopHarness(['electron', root, '--paperdesk-isolated-review']);
   assert.equal(h.appPaths.get('userData'), path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF Review'));
@@ -126,6 +154,7 @@ test('closing with unsaved edits can be cancelled', async () => {
 test('signature widths persist per signer without changing the ink image', async () => {
   const signatureFile = path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF/signatures.json');
   await mkdir(path.dirname(signatureFile), { recursive: true });
+  await rm(path.join(path.dirname(signatureFile), 'signatures.enc'), { force: true });
   await writeFile(signatureFile, '[]');
   const h = await desktopHarness();
   const dataUrl = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64')}`;
@@ -137,6 +166,10 @@ test('signature widths persist per signer without changing the ink image', async
   assert.equal(records.find(item => item.signer === 'Signer One').placementWidth, 56);
   assert.equal(records.find(item => item.signer === 'Signer Two').placementWidth, undefined);
   assert.equal(records[0].dataUrl, dataUrl);
+  const encrypted = await readFile(path.join(path.dirname(signatureFile), 'signatures.enc'));
+  assert.equal(encrypted.subarray(0, 5).toString(), 'PDSG1');
+  assert.equal(encrypted.includes(Buffer.from('Signer One')), false);
+  await assert.rejects(() => readFile(signatureFile), /ENOENT/);
   await save(h.event, { signer: 'Signer One', dataUrl, width: 800, height: 200, placementWidth: 100 });
   assert.equal((await h.handlers.get('pdf:signatures-list')(h.event)).find(item => item.signer === 'Signer One').placementWidth, 56);
   await assert.rejects(() => h.handlers.get('pdf:signatures-size')(h.event, 'Signer One', 500), /Invalid saved signature width/);
@@ -145,6 +178,7 @@ test('signature widths persist per signer without changing the ink image', async
 test('a person can save initials separately from their full signature', async () => {
   const signatureFile = path.join(root, 'tmp/qa/signature-size-app/Paperdesk PDF/signatures.json');
   await mkdir(path.dirname(signatureFile), { recursive: true });
+  await rm(path.join(path.dirname(signatureFile), 'signatures.enc'), { force: true });
   await writeFile(signatureFile, '[]');
   const h = await desktopHarness();
   const dataUrl = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64')}`;

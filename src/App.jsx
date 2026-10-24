@@ -11,6 +11,9 @@ import { createSample } from './lib/sample.mjs';
 import { formatLocalDate, isDateSignedField } from './lib/form-utils.mjs';
 import { preferredSignatureWidth, signatureSizeForField, initialSizeForField } from './lib/signature-size.mjs';
 import { findFlatInitialTargets } from './lib/initial-targets.mjs';
+import { findFlatSignatureTargets } from './lib/signature-targets.mjs';
+import { findTextMatch } from './lib/search.mjs';
+import { saveBeforeAction } from './lib/workflow.mjs';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 const emptyState = { values: {}, additions: [] };
@@ -48,6 +51,20 @@ function base64(bytes) {
   for (let i = 0; i < bytes.length; i += 32768) text += String.fromCharCode(...bytes.subarray(i, i + 32768));
   return btoa(text);
 }
+function workspaceData(file) {
+  let bytes = new Uint8Array(file.bytes), name = file.name, restored = null;
+  if (name.endsWith('.json')) {
+    const draft = JSON.parse(new TextDecoder().decode(bytes));
+    if (draft.format !== 'paperdesk-workspace-v1' || typeof draft.pdf !== 'string' || typeof draft.name !== 'string' ||
+        !draft.state?.values || typeof draft.state.values !== 'object' || !Array.isArray(draft.state.additions)) {
+      throw new Error('This is not a Paperdesk workspace. Paste bulk-fill JSON into the Bulk fill panel.');
+    }
+    bytes = Uint8Array.from(atob(draft.pdf), char => char.charCodeAt(0));
+    name = draft.name;
+    restored = draft.state;
+  }
+  return { bytes, name, restored };
+}
 
 function Modal({ title, children, onClose, wide = false }) {
   const panel = useRef(null), closeRef = useRef(onClose);
@@ -76,6 +93,7 @@ function BulkPanel({ fields, onApply, onBatch, onCopy, busy, duplicateNames, act
   const [mapping, setMapping] = useState({});
   const [record, setRecord] = useState(0);
   const [error, setError] = useState('');
+  const [flattenBatch, setFlattenBatch] = useState(true);
   const preview = parsed ? previewRecord(parsed.rows[record], mapping, fields) : null;
   const mappedCount = Object.values(mapping).filter(Boolean).length;
   const batchErrors = useMemo(() => parsed ? parsed.rows.flatMap((row, index) => previewRecord(row, mapping, fields).errors.map(error => `Record ${index + 1}: ${error}`)) : [], [parsed, mapping, fields]);
@@ -98,7 +116,7 @@ function BulkPanel({ fields, onApply, onBatch, onCopy, busy, duplicateNames, act
       {parsed.keys.some(key => !mapping[key]) && <div className="notice small">Unmapped columns will be skipped. Choose a field manually if a match is missing.</div>}
       {preview.errors.length > 0 && <div className="error-box">{preview.errors.map(error => <p key={error}>{error}</p>)}</div>}
       <button className="primary full" disabled={!mappedCount || preview.errors.length > 0 || busy || duplicateNames} onClick={() => onApply(preview.values)}><Check size={16} /> Apply this record</button>
-      {parsed.rows.length > 1 && <><button className="secondary full" disabled={!mappedCount || batchErrors.length > 0 || busy || duplicateNames} onClick={() => onBatch(parsed.rows, mapping)}><FileStack size={16} /> Save {parsed.rows.length} filled PDFs as ZIP</button>{batchErrors.length > 0 && <div className="error-box">{batchErrors.slice(0, 4).map((error, index) => <p key={index}>{error}</p>)}{batchErrors.length > 4 && <p>And {batchErrors.length - 4} more issues.</p>}</div>}<p className="tiny muted">Each record creates a separate PDF. Unmapped fields keep their current values. Batch files keep form fields editable.</p></>}
+      {parsed.rows.length > 1 && <><label className="toggle-label"><input type="checkbox" checked={flattenBatch} onChange={event => setFlattenBatch(event.target.checked)} /> Flatten batch PDFs for sharing</label><button className="secondary full" disabled={!mappedCount || batchErrors.length > 0 || busy || duplicateNames} onClick={() => onBatch(parsed.rows, mapping, flattenBatch)}><FileStack size={16} /> Save {parsed.rows.length} filled PDFs as ZIP</button>{batchErrors.length > 0 && <div className="error-box">{batchErrors.slice(0, 4).map((error, index) => <p key={index}>{error}</p>)}{batchErrors.length > 4 && <p>And {batchErrors.length - 4} more issues.</p>}</div>}<p className="tiny muted">Each record creates a separate PDF. Unmapped fields keep their current values. Keep the checkbox off if recipients need editable form fields.</p></>}
     </div>}
     <div className="bulk-tip"><ClipboardPaste size={18} /><p><strong>Filling for several people?</strong><br />Paste spreadsheet rows with their column headers, or a JSON array. You’ll get one PDF per record.</p></div>
   </div>;
@@ -107,6 +125,7 @@ function BulkPanel({ fields, onApply, onBatch, onCopy, busy, duplicateNames, act
 export default function App() {
   const [documentState, setDocument] = useState(null);
   const [review, setReview] = useState(null);
+  const [reviewTargets, setReviewTargets] = useState(null);
   const [history, setHistory] = useState({ past: [], present: emptyState, future: [] });
   const [saved, setSaved] = useState(fingerprint(emptyState));
   const [page, setPage] = useState(1), [zoom, setZoom] = useState('fit'), [rotation, setRotation] = useState(0);
@@ -133,6 +152,26 @@ export default function App() {
   const duplicateNames = labels.some(label => !label) || new Set(labels).size !== labels.length;
   const editableCount = fields.filter(field => !field.readOnly).length;
   const filledCount = fields.filter(field => !field.readOnly && (Array.isArray(state.values[field.name]) ? state.values[field.name].length : state.values[field.name])).length;
+  const reviewIssues = useMemo(() => {
+    if (!documentState) return [];
+    const blank = value => value === '' || value == null || value === false || Array.isArray(value) && !value.length;
+    const issues = [];
+    const required = fields.filter(field => field.required && !field.readOnly && blank(state.values[field.name])).length;
+    const optional = fields.filter(field => !field.required && !field.readOnly && !['button', 'unsupported', 'signature'].includes(field.type) && blank(state.values[field.name])).length;
+    const signatures = fields.filter(field => field.type === 'signature' && !additions.some(item => item.targetField === field.name)).length;
+    const dates = fields.filter(field => isDateSignedField(field) && !field.readOnly && blank(state.values[field.name])).length;
+    if (required) issues.push(`${required} required field${required === 1 ? '' : 's'} blank`);
+    if (optional) issues.push(`${optional} other form field${optional === 1 ? '' : 's'} blank`);
+    if (signatures) issues.push(`${signatures} signature box${signatures === 1 ? '' : 'es'} blank`);
+    if (dates) issues.push(`${dates} signing date${dates === 1 ? '' : 's'} blank`);
+    if (reviewTargets?.id === documentState.id) {
+      const initials = reviewTargets.initials.filter(target => !additions.some(item => item.targetField === target.fieldName)).length;
+      const flatSignatures = reviewTargets.signatures.filter(target => !additions.some(item => item.targetField === target.fieldName)).length;
+      if (initials) issues.push(`${initials} caregiver initial${initials === 1 ? '' : 's'} blank`);
+      if (flatSignatures) issues.push(`${flatSignatures} signature line${flatSignatures === 1 ? '' : 's'} blank`);
+    }
+    return issues;
+  }, [documentState, fields, state, reviewTargets]);
   const update = useCallback(transform => setHistory(history => {
     const next = typeof transform === 'function' ? transform(history.present) : transform;
     if (fingerprint(next) === fingerprint(history.present)) return history;
@@ -143,6 +182,27 @@ export default function App() {
   const notify = message => setToast(typeof message === 'string' ? { message } : message);
   useEffect(() => { if (!toast) return; const timeout = setTimeout(() => setToast(null), 6500); return () => clearTimeout(timeout); }, [toast]);
   useEffect(() => { window.paperdesk?.setDirty(dirty); }, [dirty]);
+  useEffect(() => {
+    if (!dirty || !review) return;
+    setReview(current => current ? { ...current, items: current.items.map((item, index) => index === current.index && item.ready ? { ...item, ready: false } : item) } : current);
+  }, [dirty]);
+  useEffect(() => {
+    if (!documentState) { setReviewTargets(null); return; }
+    let cancelled = false;
+    setReviewTargets(null);
+    (async () => {
+      const initials = [], signatures = [];
+      for (let number = 1; number <= documentState.pdf.numPages; number++) {
+        const pdfPage = await documentState.pdf.getPage(number);
+        const [text, annotations] = await Promise.all([pdfPage.getTextContent(), pdfPage.getAnnotations()]);
+        if (cancelled) return;
+        initials.push(...findFlatInitialTargets(text.items, number));
+        signatures.push(...findFlatSignatureTargets(text.items, annotations, number));
+      }
+      if (!cancelled) setReviewTargets({ id: documentState.id, initials, signatures });
+    })().catch(error => { if (!cancelled) setError(`Review checks could not finish: ${error.message}`); });
+    return () => { cancelled = true; };
+  }, [documentState?.id]);
   useEffect(() => {
     (window.paperdesk?.listSignatures?.() || Promise.resolve(JSON.parse(localStorage.getItem('paperdesk-signatures') || '[]')))
       .then(setSignatures).catch(error => setError(`Saved signatures could not be loaded: ${error.message}`));
@@ -213,15 +273,8 @@ export default function App() {
     setBusy('Opening your PDF…'); setError('');
     let candidate;
     try {
-      let bytes = new Uint8Array(file.bytes), name = file.name, restored = null;
+      let { bytes, name, restored } = workspaceData(file);
       if (bytes.length > 300 * 1024 * 1024) throw new Error('Choose a PDF smaller than 300 MB.');
-      if (name.endsWith('.json')) {
-        const draft = JSON.parse(new TextDecoder().decode(bytes));
-        if (draft.format !== 'paperdesk-workspace-v1' || typeof draft.pdf !== 'string' || typeof draft.name !== 'string') throw new Error('This is not a Paperdesk workspace. Paste bulk-fill JSON into the Bulk fill panel.');
-        bytes = Uint8Array.from(atob(draft.pdf), char => char.charCodeAt(0)); name = draft.name;
-        if (!draft.state?.values || typeof draft.state.values !== 'object' || !Array.isArray(draft.state.additions)) throw new Error('This workspace is missing its saved edits.');
-        restored = draft.state;
-      }
       candidate = getDocument({ data: bytes.slice(), cMapUrl: new URL('./pdfjs/cmaps/', document.baseURI).href, cMapPacked: true, standardFontDataUrl: new URL('./pdfjs/standard_fonts/', document.baseURI).href, wasmUrl: new URL('./pdfjs/wasm/', document.baseURI).href, iccUrl: new URL('./pdfjs/iccs/', document.baseURI).href, isEvalSupported: false, enableXfa: true });
       loadTask.current = candidate;
       candidate.onPassword = (submit, reason) => { setBusy(''); setPassword(''); setPasswordRequest({ submit, incorrect: reason === 2 }); };
@@ -260,6 +313,12 @@ export default function App() {
     if (window.paperdesk) { try { const file = await window.paperdesk.open(); if (file) guard(async () => { if (await loadFile(file)) setReview(null); }); } catch (error) { setError(error.message); } }
     else inputRef.current.click();
   }
+  async function openPacket() {
+    try {
+      const packet = await window.paperdesk.openPacket();
+      if (packet) guard(async () => { if (await loadFile(packet.file)) setReview({ ...packet.review, index: 0 }); });
+    } catch (cause) { setError(cause.message); }
+  }
   async function browserFile(file) { if (!file) return; try { const bytes = new Uint8Array(await file.arrayBuffer()); guard(async () => { if (await loadFile({ name: file.name, bytes })) setReview(null); }); } catch (error) { setError(error.message); } }
   function showReviewItem(index) {
     if (!review || index === review.index || index < 0 || index >= review.items.length || busy) return;
@@ -269,6 +328,42 @@ export default function App() {
         if (await loadFile(file)) setReview(current => current?.id === review.id ? { ...current, index } : current);
       } catch (error) { setError(error.message); }
     });
+  }
+  async function exportPacketFinals() {
+    if (!review?.root || dirty) return;
+    const ready = review.items.map((item, index) => item.ready ? index : -1).filter(index => index >= 0);
+    if (!ready.length) return;
+    setBusy(`Exporting 0 of ${ready.length} reviewed PDFs…`);
+    try {
+      const fontBytes = await getFont();
+      for (let position = 0; position < ready.length; position++) {
+        const index = ready[position];
+        setBusy(`Exporting ${position + 1} of ${ready.length}: ${review.items[index].name}`);
+        let bytes, descriptors, values, marks, readOnlyReason;
+        if (index === review.index) {
+          ({ bytes, fields: descriptors, readOnlyReason } = documentState);
+          ({ values, additions: marks } = state);
+        } else {
+          const file = await window.paperdesk.reviewFile(review.id, index);
+          const parsed = workspaceData(file);
+          bytes = parsed.bytes;
+          const inspected = await inspectPdf(bytes);
+          ({ fields: descriptors, readOnlyReason } = inspected);
+          const mapping = Object.fromEntries(descriptors.filter(field => !field.readOnly).map(field => [field.name, field.name]));
+          const checked = parsed.restored ? previewRecord(parsed.restored.values, mapping, descriptors) : { values: {} };
+          if (checked.errors?.length) throw new Error(`${review.items[index].name}: ${checked.errors.join(' ')}`);
+          values = { ...Object.fromEntries(descriptors.map(field => [field.name, field.value])), ...checked.values };
+          marks = parsed.restored?.additions || [];
+        }
+        try {
+          const output = readOnlyReason ? bytes : await writePdf(bytes, descriptors, values, marks, { flatten: true, fontBytes });
+          await window.paperdesk.exportPacketFile(review.id, index, output);
+          setReview(current => current?.id === review.id ? { ...current, items: current.items.map((item, i) => i === index ? { ...item, exported: true, ready: false } : item) } : current);
+        } catch (cause) { throw new Error(`${review.items[index].name}: ${cause.message}`); }
+      }
+      notify(`${ready.length} final PDF${ready.length === 1 ? '' : 's'} saved in the packet’s Final PDFs folder.`);
+    } catch (cause) { setError(`Packet export stopped: ${cause.message}`); }
+    finally { setBusy(''); }
   }
   useEffect(() => {
     window.paperdesk?.initialFile().then(async open => { if (open && await loadFile(open.file)) setReview(open.review ? { ...open.review, index: 0 } : null); }).catch(error => setError(error.message));
@@ -309,12 +404,20 @@ export default function App() {
     setBusy('Saving your editable work…');
     try {
       const json = JSON.stringify({ format: 'paperdesk-workspace-v1', name: documentState.name, pdf: base64(documentState.bytes), state });
-      const result = await saveArtifact(new TextEncoder().encode(json), `${fileStem(documentState.name)}.paperdesk.json`, 'json', { overwritePath: documentState.workspacePath });
+      const result = await saveArtifact(new TextEncoder().encode(json), `${fileStem(documentState.name)}.paperdesk.json`, 'json', { overwritePath: documentState.workspacePath, sourcePath: documentState.sourcePath });
       if (result) {
         if (result.path) setDocument(current => { const next = { ...current, sourcePath: result.path, workspacePath: result.path }; documentRef.current = next; return next; });
+        if (result.path && review?.root) {
+          try {
+            const item = await window.paperdesk.updatePacketItem(review.id, review.index, result.path);
+            setReview(current => current?.id === review.id ? { ...current, items: current.items.map((entry, index) => index === review.index ? { ...entry, ...item, ready: false } : entry) } : current);
+          } catch (cause) { setError(`Saved, but the packet list could not be updated: ${cause.message}`); }
+        }
         setSaved(fingerprint(state)); setModal(null); notify({ message: `Saved your editable work in ${result.name}`, path: result.path });
+        return true;
       }
-    } catch (error) { setError(error.message); } finally { setBusy(''); }
+      return false;
+    } catch (error) { setError(error.message); return false; } finally { setBusy(''); }
   }
   async function copySchema() {
     if (!allFields.length) { setError('Add a named text box first, or open a fillable PDF.'); return; }
@@ -322,7 +425,7 @@ export default function App() {
     const text = JSON.stringify(fieldSchema(fields, additions), null, 2);
     try { await navigator.clipboard.writeText(text); notify('Field list copied. Paste it into this chat with the information to fill.'); } catch { setModal({ type: 'copy', text }); }
   }
-  async function batch(rows, mapping) {
+  async function batch(rows, mapping, flatten = true) {
     setBusy('Preparing the batch…');
     try {
       const zip = new JSZip(), fontBytes = await getFont();
@@ -332,7 +435,7 @@ export default function App() {
         const result = previewRecord(rows[index], mapping, allFields);
         if (result.errors.length) throw new Error(`Record ${index + 1}: ${result.errors.join(' ')}`);
         const next = applyValues(result.values);
-        const output = await writePdf(documentState.bytes, fields, next.values, next.additions, { fontBytes });
+        const output = await writePdf(documentState.bytes, fields, next.values, next.additions, { flatten, fontBytes });
         totalBytes += output.length;
         if (totalBytes > 300 * 1024 * 1024) throw new Error('This batch exceeds 300 MB. Split your data into smaller batches.');
         zip.file(`${String(index + 1).padStart(3, '0')}-${fileStem(documentState.name)}.pdf`, output);
@@ -353,9 +456,8 @@ export default function App() {
         const page = await documentState.pdf.getPage(i);
         const content = await page.getTextContent();
         if (run !== searchRun.current) return;
-        const text = content.items.map(item => item.str || '').join(' ');
-        const index = text.toLowerCase().indexOf(query);
-        if (index >= 0) results.push({ page: i, snippet: `${index > 45 ? '…' : ''}${text.slice(Math.max(0, index - 45), index + query.length + 90)}…` });
+        const match = findTextMatch(content.items.map(item => ({ text: item.str || '', hasEOL: item.hasEOL })), query);
+        if (match) results.push({ page: i, snippet: `${match.start > 45 ? '…' : ''}${match.text.slice(Math.max(0, match.start - 45), match.end + 90).replace(/\s+/g, ' ')}…` });
       }
       if (run === searchRun.current) setSearchResults(results);
     } catch (error) { if (run === searchRun.current) setError(error.message); } finally { if (run === searchRun.current) setSearching(false); }
@@ -394,7 +496,7 @@ export default function App() {
     const flatDate = target.date && { id: crypto.randomUUID(), kind: 'text', targetField: `${target.fieldName}:date`, page: target.page, x: target.date.x, y: target.date.y, text: formatLocalDate(), label: target.date.label, size: 10, rotation: 0 };
     const printedName = target.printedName && { id: crypto.randomUUID(), kind: 'text', targetField: `${target.fieldName}:printed-name`, page: target.page, x: target.printedName.x, y: target.printedName.y, text: record.signer, label: target.printedName.label, size: 10, rotation: 0 };
     update(current => ({
-      values: isDateSignedField(dateField) && !current.values[target.dateFieldName] ? { ...current.values, [target.dateFieldName]: formatLocalDate() } : current.values,
+      values: isDateSignedField(dateField) ? { ...current.values, [target.dateFieldName]: formatLocalDate() } : current.values,
       additions: [...current.additions.filter(existing => (existing.targetField !== target.fieldName && existing.targetField !== `${target.fieldName}:date` && existing.targetField !== `${target.fieldName}:printed-name`) || existing.page !== target.page), item, ...(flatDate ? [flatDate] : []), ...(printedName ? [printedName] : [])],
     }));
     setSelected(id); setPage(target.page); setTool('select'); setActiveSignature(null); setSignTarget(null); setModal(null);
@@ -446,9 +548,9 @@ export default function App() {
     <input ref={inputRef} className="visually-hidden" type="file" accept=".pdf,.paperdesk.json" aria-label="Choose PDF file" onChange={event => { browserFile(event.target.files?.[0]); event.target.value = ''; }} />
     <header className="app-header"><button className="brand" title="Paperdesk home" onClick={() => guard(() => { const previous = documentRef.current; documentRef.current = null; setDocument(null); setReview(null); setHistory({ past: [], present: emptyState, future: [] }); setSaved(fingerprint(emptyState)); previous?.pdf.loadingTask.destroy(); })}><span className="brand-mark"><FileText size={23} strokeWidth={1.7} /></span><span>paperdesk<span className="brand-pdf">PDF</span></span></button>
       <div className="header-center">{documentState ? <><FileText size={15} /><span title={documentState.name}>{documentState.name}</span><span className={`save-status ${dirty ? 'unsaved' : ''}`}>{dirty ? 'Unsaved changes' : 'All set'}</span></> : <span className="header-tagline">A little less paperwork.</span>}</div>
-      <div className="header-actions"><button className="icon-button help-button" aria-label="Help" onClick={() => setModal('help')}><HelpCircle size={19} /></button><button className="secondary" onClick={open} disabled={Boolean(busy)}><FolderOpen size={16} /> Open PDF</button>{documentState && <>{!readOnly && <button className="secondary" onClick={saveWorkspace} disabled={Boolean(busy)}><Save size={16} /> Save</button>}<button className="primary" onClick={() => setModal('export')} disabled={Boolean(busy)}><Download size={16} /> {readOnly ? 'Save a copy' : 'Export final PDF'}</button></>}</div>
+      <div className="header-actions"><button className="icon-button help-button" aria-label="Help" onClick={() => setModal('help')}><HelpCircle size={19} /></button><button className="secondary" onClick={open} disabled={Boolean(busy)}><FolderOpen size={16} /> Open PDF</button>{window.paperdesk && <button className="secondary" onClick={openPacket} disabled={Boolean(busy)}><FileStack size={16} /> Open packet</button>}{documentState && <>{!readOnly && <button className="secondary" onClick={saveWorkspace} disabled={Boolean(busy)}><Save size={16} /> Save</button>}<button className="primary" onClick={() => setModal('export')} disabled={Boolean(busy)}><Download size={16} /> {readOnly ? 'Save a copy' : 'Export final PDF'}</button></>}</div>
     </header>
-    {review && documentState && <nav className="review-queue" aria-label="Document review queue"><span className="review-queue-title">REVIEW QUEUE</span><strong>{review.index + 1} of {review.items.length}</strong><select aria-label="Jump to form" value={review.index} onChange={event => showReviewItem(Number(event.target.value))} disabled={Boolean(busy)}>{review.items.map((item, index) => <option key={index} value={index}>{index + 1}. {reviewLabel(item.name)}</option>)}</select><button className="secondary" onClick={() => showReviewItem(review.index - 1)} disabled={review.index === 0 || Boolean(busy)}><ChevronLeft size={16} /> Previous form</button><button className="primary" onClick={() => showReviewItem(review.index + 1)} disabled={review.index === review.items.length - 1 || Boolean(busy)}>Next form <ChevronRight size={16} /></button></nav>}
+    {review && documentState && <><nav className="review-queue" aria-label="Document review queue"><span className="review-queue-title">REVIEW QUEUE</span><strong>{review.index + 1} of {review.items.length}</strong><select aria-label="Jump to form" value={review.index} onChange={event => showReviewItem(Number(event.target.value))} disabled={Boolean(busy)}>{review.items.map((item, index) => <option key={index} value={index}>{index + 1}. {item.location || reviewLabel(item.name)} {item.ready ? '· Ready' : item.exported ? '· Final saved' : ''}</option>)}</select><button className="secondary" onClick={() => showReviewItem(review.index - 1)} disabled={review.index === 0 || Boolean(busy)}><ChevronLeft size={16} /> Previous form</button><button className="primary" onClick={() => showReviewItem(review.index + 1)} disabled={review.index === review.items.length - 1 || Boolean(busy)}>Next form <ChevronRight size={16} /></button></nav>{review.root && <div className="packet-checks"><span>{reviewTargets?.id === documentState.id ? reviewIssues.length ? `Check before export: ${reviewIssues.join(' · ')}` : 'No obvious blanks found. Review the page before marking ready.' : 'Checking fields, signing lines, and initials…'}</span><button className="secondary" disabled={Boolean(busy) || dirty || reviewTargets?.id !== documentState.id} onClick={() => setReview(current => ({ ...current, items: current.items.map((item, index) => index === current.index ? { ...item, ready: !item.ready } : item) }))}>{review.items[review.index].ready ? 'Unmark ready' : 'Mark reviewed'}</button><button className="primary" disabled={Boolean(busy) || dirty || !review.items.some(item => item.ready)} onClick={exportPacketFinals}>Export {review.items.filter(item => item.ready).length} reviewed finals</button></div>}</>}
     {!documentState ? <main className="welcome"><div className="welcome-main"><span className="welcome-kicker"><span /> YOUR EVERYDAY PDF WORKSPACE</span><h1>Paperwork,<br /><em>without the work.</em></h1><p className="welcome-description">Open it. Fill it. Make it yours.<br />A simpler home for your PDFs, right on your computer.</p><div className="drop-card" onClick={open} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } }} role="button" tabIndex={0} aria-label="Open a PDF"><div className="drop-icon"><FileText size={30} strokeWidth={1.4} /><span><Plus size={13} /></span></div><div><h2>Drop your PDF here</h2><p>or click to choose a file</p></div><span className="drop-arrow"><ArrowUpRight size={22} /></span></div><div className="welcome-under"><span><LockKeyhole size={13} /> Files stay on your computer</span><button className="text-button" onClick={() => guard(async () => { try { setBusy('Creating a practice form…'); await loadFile({ name: 'Welcome to Paperdesk.pdf', bytes: await createSample() }); } catch (error) { setBusy(''); setError(error.message); } })}>Try a practice form <ArrowRight size={14} /></button></div></div>
       <div className="welcome-art" aria-hidden="true"><div className="paper-back" /><div className="illustration-paper"><div className="mini-brand"><span /> PAPERDESK</div><div className="paper-title">Goodbye, busywork.</div><div className="paper-subtitle">Hello, done.</div><div className="illustration-rule" /><div className="mock-label">FULL NAME</div><div className="mock-field">Jamie Parker<span className="caret" /></div><div className="mock-two"><div><div className="mock-label">YOUR EMAIL</div><div className="mock-line" /></div><div><div className="mock-label">DATE</div><div className="mock-line short" /></div></div><div className="mock-checkbox"><span><Check size={13} /></span> A much better way to PDF.</div><div className="mock-signature">All taken care of.</div><div className="paper-bottom">ONE LESS THING ON YOUR LIST <span>01</span></div></div><div className="floating-chip"><CheckCircle2 size={20} /><span>Filled, saved, sorted.</span></div><div className="annotation-chip"><Sparkles size={14} /> A helping hand, built in</div></div>
       <div className="welcome-features"><div><span className="feature-icon"><FileText size={20} /></span><section><h3>Read comfortably</h3><p>A clear view. Every page, every detail.</p></section></div><div><span className="feature-icon"><Type size={20} /></span><section><h3>Fill any layout</h3><p>Use form fields or add your own text.</p></section></div><div><span className="feature-icon"><Layers size={20} /></span><section><h3>Skip the repetitive bits</h3><p>Paste your details and fill in bulk.</p></section></div></div>
@@ -475,18 +577,18 @@ export default function App() {
         </aside>
       </main>
     </>}
-    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : 'Changes are saved only when you choose Save'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.0.4</>}</span></footer>
+    <footer className="status-bar"><span><span className="status-dot" /> Local workspace <span className="status-separator">/</span> No uploads. No account.</span><span>{documentState ? <>{readOnly ? 'View only' : 'Changes are saved only when you choose Save'}<span className="status-separator">·</span>Ctrl+S to save</> : <>Made for the everyday.<span className="status-separator">·</span>Paperdesk 1.0.5</>}</span></footer>
     {dragging && <div className="drop-overlay"><FileText size={48} /><h2>Drop it here. We’ll take it from there.</h2><p>PDF or Paperdesk workspace</p></div>}
     {toast && <div className="toast" role="status"><CheckCircle2 size={19} /><span>{toast.message}</span>{toast.path && <button onClick={() => window.paperdesk?.showOutput(toast.path)}>Show file</button>}<button className="icon-button" aria-label="Dismiss notification" onClick={() => setToast(null)}><X size={16} /></button></div>}
     {(modal === 'signatures' || modal === 'initials') && <SignatureDialog signatures={signatures} kind={modal === 'initials' ? 'initials' : 'signature'} target={signTarget} pageCount={documentState?.pdf.numPages || 1} onSave={saveSignature} onRemove={removeSignature} onPlace={record => { if (signTarget) modal === 'initials' ? placeInitialInField(record, signTarget) : placeSignatureInField(record, signTarget); else { setActiveSignature(record); setTool(modal === 'initials' ? 'initials' : 'signature'); setModal(null); } }} onPlaceAll={record => placeInitialsOnAllPages(record, signTarget)} onClose={() => { setModal(null); setSignTarget(null); }} />}
-    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content"><p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Fillable fields appear in the right panel.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature, printed name where requested, and signing date. Use Today beside a signing date to set it separately. Review before saving.</p><p><b>4. Initial reports.</b> Click Initial in the toolbar to draw or import each person's initials. On a HSEGH page, click Initial above either caregiver blank. Choose Initial here for that page, or All pages after you have reviewed the complete report. Each person's initials are saved separately from their full signature.</p><p><b>5. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>6. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF to put one flattened PDF in the Final PDFs folder beside your source file. A CSV or JSON array can produce one filled PDF per record.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures and initials. It does not include OCR, certificate signing, or editing existing page text. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
+    {modal === 'help' && <Modal title="A simpler way to PDF" onClose={() => setModal(null)}><div className="help-content"><p><b>1. Open your PDF.</b> Use Open PDF or drag a file into the window. Use Open packet to review a whole folder in order.</p><p><b>2. Fill in the details.</b> Type in the fields, or use Add text and Checkmark for flat forms. Name text boxes to use them in bulk filling.</p><p><b>3. Sign when ready.</b> Click Sign here beside a signature line and choose the signer. Paperdesk places the saved signature, printed name where requested, and signing date when it can safely match the date field. Use Today beside a signing date to set it separately. Review before saving.</p><p><b>4. Initial reports.</b> Click Initial in the toolbar to draw or import each person's initials. On a HSEGH page, click Initial above either caregiver blank. Choose Initial here for that page, or All pages after you have reviewed the complete report. Each person's initials are saved separately from their full signature.</p><p><b>5. Get help from this chat.</b> In Bulk fill, copy the field list and paste it here with your details. Paste the JSON response into the app, review matches, and apply. This workflow doesn’t require an API key.</p><p><b>6. Save and export.</b> Use Save to keep an editable workspace. When the form is final, use Export final PDF. In a packet, Save each form, mark it reviewed, then export the reviewed finals together. Long answers that cannot fit readably stop export so you can shorten them.</p><div className="notice">This version supports standard PDF forms and placed text or ink-image signatures and initials. It does not include OCR, certificate signing, or editing existing page text. Encrypted, XFA, and digitally signed files open in view-only mode.</div><p className="tiny muted">PDF rendering: <a href="https://mozilla.github.io/pdf.js/" onClick={event => event.preventDefault()}>Mozilla PDF.js</a>. PDF writing: <a href="https://pdf-lib.js.org/" onClick={event => event.preventDefault()}>pdf-lib</a>. Fonts: Inter and Noto Sans.</p></div></Modal>}
     {modal === 'export' && <Modal title={readOnly ? 'Save a PDF copy' : 'Export final PDF'} onClose={busy ? null : () => setModal(null)}>
       <p className="muted">{readOnly ? 'This file is view-only. Save a separate PDF copy.' : 'Create one finished PDF for this form, with answers and signatures fixed on the page.'}</p>
       {!readOnly && <><div className="notice small"><b>Finals folder:</b> <code className="final-folder">{finalFolder(documentState.sourcePath) || 'Choose a folder in the Save dialog'}</code></div><p className="tiny muted">Flattening removes editable form fields. Another PDF editor could still change the file.</p></>}
       <button className="primary full" onClick={exportFinal} disabled={Boolean(busy)}><Download size={17} /> {readOnly ? 'Save PDF copy' : 'Export flattened PDF'}</button>
       <p className="tiny muted">Your draft stays editable. Exporting does not overwrite it.</p>
     </Modal>}
-    {modal === 'discard' && <Modal title="You have unsaved changes" onClose={() => { setModal(null); setPendingAction(null); }}><p className="muted">Use Save first if you want to keep editing the details you entered.</p><div className="modal-actions"><button className="secondary" onClick={() => { const action = pendingAction; setModal(null); setPendingAction(null); action?.(); }}>Discard changes</button><button className="primary" onClick={() => { setPendingAction(null); saveWorkspace(); }}>Save first</button></div></Modal>}
+    {modal === 'discard' && <Modal title="You have unsaved changes" onClose={() => { setModal(null); setPendingAction(null); }}><p className="muted">Use Save first if you want to keep editing the details you entered.</p><div className="modal-actions"><button className="secondary" onClick={() => { const action = pendingAction; setModal(null); setPendingAction(null); action?.(); }}>Discard changes</button><button className="primary" onClick={async () => { const action = pendingAction; if (await saveBeforeAction(saveWorkspace, action)) setPendingAction(null); }}>Save first</button></div></Modal>}
     {modal?.type === 'copy' && <Modal title="Copy this field list into your chat" onClose={() => setModal(null)}><textarea className="schema-text" readOnly value={modal.text} onFocus={event => event.target.select()} /><p className="tiny muted">Select all and press Ctrl+C, then paste into your chat with the details to fill.</p></Modal>}
     {passwordRequest && <Modal title="This PDF needs a password" onClose={() => { loadTask.current?.destroy(); setPasswordRequest(null); setBusy(''); }}><form onSubmit={event => { event.preventDefault(); passwordRequest.submit(password); setPasswordRequest(null); setBusy('Unlocking your PDF…'); }}><p className="muted">{passwordRequest.incorrect ? 'That password did not work. Try again.' : 'Enter the password to view this document.'}</p><input type="password" aria-label="PDF password" value={password} onChange={event => setPassword(event.target.value)} autoFocus /><button className="primary full" type="submit">Open document</button></form></Modal>}
     {error && <Modal title="That didn’t quite work" onClose={() => setError('')}><div className="error-detail"><AlertCircle size={24} /><p>{error}</p></div><button className="primary full" onClick={() => setError('')}>Got it</button></Modal>}
