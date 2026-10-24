@@ -12,11 +12,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 async function desktopHarness(argv = ['electron', root]) {
   const handlers = new Map(), listeners = new Map(), protocols = new Map();
   let mainWindow;
+  let printHandler = (options, callback) => callback(false, 'Print job canceled');
   const dialog = { showOpenDialog: async () => ({ canceled: true }), showSaveDialog: async () => ({ canceled: true }), showMessageBoxSync: () => 0 };
   class WindowMock {
     constructor(options) {
       this.options = options;
-      this.webContents = { mainFrame: {}, send: (...args) => { this.sent = args; }, executeJavaScript: script => script.includes('afterprint') ? new Promise(() => {}) : Promise.resolve([]), print: (options, callback) => { this.printOptions = options; callback(false, 'Print job canceled'); }, setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} } };
+      this.webContents = { mainFrame: {}, send: (...args) => { this.sent = args; }, executeJavaScript: script => script.includes('afterprint') ? new Promise(() => {}) : Promise.resolve([]), print: (options, callback) => { this.printOptions = options; printHandler(options, callback); }, setWindowOpenHandler() {}, on() {}, session: { setPermissionRequestHandler() {} } };
       this.listeners = new Map(); mainWindow = this;
     }
     on(name, handler) { this.listeners.set(name, handler); }
@@ -38,7 +39,7 @@ async function desktopHarness(argv = ['electron', root]) {
   const context = vm.createContext({ require: name => name === 'electron' ? electron : require(name), __dirname: path.join(root, 'electron'), process: { argv, env: {} }, Buffer, Uint8Array, Response, URL });
   vm.runInContext(await readFile(path.join(root, 'electron/main.cjs'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
-  return { handlers, listeners, protocols, dialog, appPaths, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
+  return { handlers, listeners, protocols, dialog, appPaths, setPrintHandler: handler => { printHandler = handler; }, window: mainWindow, event: { sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame } };
 }
 
 test('desktop loads only local assets with sandboxed, isolated renderer', async () => {
@@ -167,6 +168,15 @@ test('native print cancellation resolves without reporting a sent job and valida
   const h = await desktopHarness(), print = h.handlers.get('pdf:print');
   assert.equal(await print(h.event, [{ data: 'data:image/png;base64,iVBORw0KGgo=', width: 612, height: 792 }]), false);
   await assert.rejects(() => print(h.event, [{ data: 'https://external.example/image.png', width: 612, height: 792 }]), /Invalid print/);
+});
+
+test('End print session releases a native print call whose callback never arrives', async () => {
+  const h = await desktopHarness();
+  h.setPrintHandler(() => {});
+  const pending = h.handlers.get('pdf:print')(h.event, [{ data: 'data:image/png;base64,iVBORw0KGgo=', width: 612, height: 792 }]);
+  await new Promise(resolve => setImmediate(resolve));
+  await h.handlers.get('pdf:print-cancel')(h.event);
+  assert.equal(await pending, false);
 });
 
 test('closing with unsaved edits requests Save first in the renderer before closing', async () => {
