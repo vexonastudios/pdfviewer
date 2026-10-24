@@ -8,6 +8,7 @@ createServer(async (request, response) => {
     const pathname = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
     const file = path.resolve(root, '.' + (pathname === '/' ? '/index.html' : pathname));
     if (path.relative(root, file).startsWith('..')) { response.writeHead(403).end(); return; }
-    response.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream' }); response.end(await readFile(file));
+    const bytes = await readFile(file);
+    response.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream' }); response.end(bytes);
   } catch { response.writeHead(404).end(); }
 }).listen(5245, '127.0.0.1');
